@@ -364,3 +364,54 @@ def test_select_moe_comm_method_310p_uses_allgather(monkeypatch):
     )
 
     assert afc.select_moe_comm_method(128, _make_vllm_config()) == MoECommType.ALLGATHER
+
+
+@pytest.mark.parametrize(
+    ("num_prefills", "num_tokens", "expected"),
+    [
+        (1, 128, MoECommType.FUSED_MC2),
+        (1, 4097, MoECommType.FUSED_MC2),
+        (0, 128, MoECommType.MC2),
+        (0, 129, MoECommType.ALLGATHER),
+    ],
+)
+def test_select_moe_comm_method_a2_prefill_vs_decode(monkeypatch, num_prefills, num_tokens, expected):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A2,
+        capacity=128,
+        ep_world_size=16,
+        enable_fused_mc2=1,
+    )
+    vllm_config = _make_vllm_config(world_size=16, num_experts=128)
+    attn_metadata = SimpleNamespace(num_prefills=num_prefills)
+
+    assert afc.select_moe_comm_method(num_tokens, vllm_config, attn_metadata=attn_metadata) == expected
+
+
+def test_select_moe_comm_method_a2_fused_mc2_disabled_decode(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A2,
+        capacity=128,
+        ep_world_size=16,
+        enable_fused_mc2=0,
+    )
+    vllm_config = _make_vllm_config(world_size=16, num_experts=128)
+    attn_metadata = SimpleNamespace(num_prefills=1)
+
+    assert afc.select_moe_comm_method(128, vllm_config, attn_metadata=attn_metadata) == MoECommType.MC2
+
+
+def test_select_moe_comm_method_a2_profile_run_uses_fused_mc2(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A2,
+        capacity=128,
+        ep_world_size=16,
+        enable_fused_mc2=1,
+    )
+    vllm_config = _make_vllm_config(world_size=16, num_experts=128)
+    attn_metadata = SimpleNamespace(num_prefills=0)
+
+    assert afc.select_moe_comm_method(128, vllm_config, attn_metadata=attn_metadata, in_profile_run=True) == MoECommType.FUSED_MC2
