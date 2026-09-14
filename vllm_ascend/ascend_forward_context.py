@@ -288,6 +288,22 @@ def _select_a2_moe_comm_method(
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
 ) -> MoECommType:
+    if get_ascend_config().enable_fused_mc2 == 1:
+        # On A2 the fused path relies on the CANN mega_moe op from
+        # cann_ops_transformer only. The dispatch_ffn_combine fallback is an
+        # A3-targeted csrc kernel (csrc/mc2/dispatch_ffn_combine_w4_a8) and
+        # must not be selected on A2.
+        if (
+            _MEGA_MOE_SUPPORTED
+            and get_ep_group().world_size <= 64
+            and _cann_megamoe_supported_by_config(vllm_config)
+        ):
+            return MoECommType.FUSED_MC2
+        logger.warning_once(
+            "enable_fused_mc2=1 on A2 requires the cann_ops_transformer mega_moe op "
+            "(EP size <= 64, hidden_size within [1024, 8192] and a multiple of 512, "
+            "w8a8/w4a8 quant). Falling back to MC2/ALLGATHER."
+        )
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = (
         vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
