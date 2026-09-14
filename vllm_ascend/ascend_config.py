@@ -155,21 +155,40 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_FUSED_MC2",
             ascend_envs.VLLM_ASCEND_ENABLE_FUSED_MC2,
         )
-        assert self.enable_fused_mc2 in (0, 1), f"enable_fused_mc2 must be 0 or 1, got {self.enable_fused_mc2}"
+        assert self.enable_fused_mc2 in (0, 1, 2), (
+            f"enable_fused_mc2 must be 0, 1 (CANN mega_moe) or 2 (ZercMoE), got {self.enable_fused_mc2}"
+        )
         model_architectures = getattr(vllm_config.model_config, "architectures", None) or []
         assert not (
-            self.enable_fused_mc2 == 1
+            self.enable_fused_mc2 != 0
             and any(architecture.startswith("MiniMaxM3") for architecture in model_architectures)
         ), (
-            "MiniMax M3 does not support enable_fused_mc2=1. Please set "
+            "MiniMax M3 does not support enable_fused_mc2 != 0. Please set "
             "additional_config.enable_fused_mc2 to 0 or unset VLLM_ASCEND_ENABLE_FUSED_MC2."
         )
-        if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
+        if self.enable_fused_mc2 != 0 and self.multistream_overlap_shared_expert:
             self.multistream_overlap_shared_expert = False
             logger.warning_once(
                 "VLLM_ASCEND_ENABLE_FUSED_MC2 (fused mc2) and multistream_overlap_shared_expert "
                 "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
             )
+        # ZercMoE backend (enable_fused_mc2 == 2, A2 only): library / bootstrap / heap settings.
+        self.zercmoe_lib_path = additional_config.get("zercmoe_lib_path", "") or os.getenv(
+            "VLLM_ASCEND_ZERCMOE_LIB_PATH", ""
+        )
+        if self.enable_fused_mc2 == 2 and not self.zercmoe_lib_path:
+            raise ValueError(
+                "enable_fused_mc2=2 (ZercMoE backend) requires zercmoe_lib_path pointing to "
+                "libdispatch_gmm_ops.so. Set additional_config.zercmoe_lib_path or "
+                "VLLM_ASCEND_ZERCMOE_LIB_PATH."
+            )
+        default_ipport = f"tcp://{os.getenv('MASTER_ADDR', '127.0.0.1')}:{os.getenv('MASTER_PORT', '29500')}"
+        self.zercmoe_ipport = additional_config.get("zercmoe_ipport", "") or os.getenv(
+            "VLLM_ASCEND_ZERCMOE_IPPORT", ""
+        ) or default_ipport
+        self.zercmoe_mem_size_mb = int(
+            additional_config.get("zercmoe_mem_size_mb", 0) or os.getenv("VLLM_ASCEND_ZERCMOE_MEM_SIZE_MB", 0) or 18000
+        )
         self.enable_mlapo = self._get_config_value(
             additional_config,
             "enable_mlapo",

@@ -54,6 +54,42 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def set_lora_context(self, lora_context) -> None:
         self.lora_context = lora_context
 
+    @staticmethod
+    def _pack_zercmoe_zn(w: torch.Tensor) -> torch.Tensor:
+        """[k, n] ND bf16 -> ZercMoE zN fractal (n/16, k, 16) flattened."""
+        k, n = w.shape
+        if k % 16 != 0 or n % 16 != 0:
+            raise ValueError(f"ZercMoE zN packing requires weight dims % 16 == 0, got shape {(k, n)}.")
+        return w.reshape(k, n // 16, 16).permute(1, 0, 2).contiguous().reshape(-1)
+
+    @classmethod
+    def _pack_zercmoe_weights(cls, layer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack unquantized MoE weights for the ZercMoE dispatch_gmm_combine op.
+
+        By the time this runs, process_weights_after_loading has already
+        transposed the weights to [E, K, n1] (w13) / [E, n2, K] (w2), which
+        match ZercMoE's w1_nd [E, K, n] / w2_nd [E, n, K] ND conventions. The
+        op requires the same intermediate dim n for both GEMMs (full-width
+        SiLU FFN, no gate/up split), so standard SwiGLU models (n1 = 2*I !=
+        n2 = I) are rejected here. Dummy int64 scales carry n/k for the op's
+        shape derivation.
+        """
+        w13 = layer.w13_weight.data  # [E, K, n1]
+        w2 = layer.w2_weight.data  # [E, n2, K]
+        num_local_experts, hidden_size, n1 = w13.shape
+        n2 = w2.shape[1]
+        if n1 != n2:
+            raise ValueError(
+                f"ZercMoE backend requires w13 output dim == w2 input dim (plain full-width "
+                f"FFN without gate/up split), got w13 out={n1} vs w2 in={n2}. Standard "
+                "SwiGLU models (w13 out = 2 * intermediate) are not supported by ZercMoE."
+            )
+        b1 = torch.cat([cls._pack_zercmoe_zn(w) for w in w13.unbind(0)])
+        b2 = torch.cat([cls._pack_zercmoe_zn(w) for w in w2.unbind(0)])
+        s1 = torch.zeros(num_local_experts, n1, dtype=torch.int64, device=w13.device)
+        s2 = torch.zeros(num_local_experts, hidden_size, dtype=torch.int64, device=w13.device)
+        return b1, b2, s1, s2
+
     @property
     def is_monolithic(self) -> bool:
         return False
@@ -89,10 +125,23 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # npu_format_cast. At that point, the operator should be able to handle weights
         # in their native format without explicit casting here.
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
-        if enable_fused_mc2:
+        if enable_fused_mc2 == 2:
+            # ZercMoE backend: pack weights into its own zN layout ((n/16, k, 16)
+            # per expert) and keep the ND weights for other code paths (e.g.
+            # online weight updates); the packed tensors are consumed by
+            # FusedMC2CommImpl._apply_zercmoe.
+            if self.dynamic_eplb:
+                raise NotImplementedError("ZercMoE backend (enable_fused_mc2=2) does not support dynamic EPLB.")
+            (
+                layer.zercmoe_b1,
+                layer.zercmoe_b2,
+                layer.zercmoe_s1,
+                layer.zercmoe_s2,
+            ) = self._pack_zercmoe_weights(layer)
+        elif enable_fused_mc2 == 1:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-            if enable_fused_mc2 == 1 and self.dynamic_eplb:
+            if self.dynamic_eplb:
                 layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
                 layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
                 del layer.w13_weight
@@ -119,7 +168,25 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w13_weight_list = getattr(layer, "w13_weight_list", None)
         w2_weight_list = getattr(layer, "w2_weight_list", None)
         has_split_weight_lists = isinstance(w13_weight_list, list) and isinstance(w2_weight_list, list)
-        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+        if (
+            _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
+            and get_ascend_config().enable_fused_mc2 == 2
+        ):
+            # ZercMoE backend: pre-packed zN weights + dummy int64 scales
+            # ([E, n] / [E, k]) that the op uses for shape derivation.
+            if getattr(layer, "zercmoe_b1", None) is None:
+                raise RuntimeError(
+                    "FUSED_MC2 with the ZercMoE backend was selected, but layer weights were not "
+                    "packed (expected layer.zercmoe_b1 from process_weights_after_loading with "
+                    "enable_fused_mc2=2)."
+                )
+            w1 = layer.zercmoe_b1
+            w2 = layer.zercmoe_b2
+            w1_scale = layer.zercmoe_s1
+            w2_scale = layer.zercmoe_s2
+            w1_scale_bias = None
+            w2_scale_bias = None
+        elif _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
             if self.dynamic_eplb and not has_split_weight_lists:
                 logger.warning_once(
                     "FUSED_MC2 is enabled with dynamic EPLB, but unquantized MoE weights are not split into "

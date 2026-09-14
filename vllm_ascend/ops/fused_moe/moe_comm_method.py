@@ -47,6 +47,12 @@ from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
+# ZercMoE (enable_fused_mc2 == 2) process-wide state. The SHMEM bootstrap in
+# dispatch_gmm_init is collective and must run exactly once per process, so it
+# is guarded by module-level flags instead of per-layer instance state
+# (setup_moe_comm_method re-creates comm-method instances for every MoE layer).
+_ZERCMOE_STATE = {"lib_loaded": False, "initialized": False}
+
 
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
     return _MoECommMethods.get(moe_comm_type)
@@ -412,6 +418,96 @@ class FusedMC2CommImpl(MoECommMethod):
         # return value, so there is nothing to keep on the instance.
         return out, expert_tokens
 
+    def _init_zercmoe(self):
+        """One-time ZercMoE bootstrap: load libdispatch_gmm_ops.so and run the
+        collective dispatch_gmm_init over the EP (mc2) group.
+
+        Called lazily from the first fused_experts() so the SHMEM heap is
+        allocated after vLLM's memory profiling (which happens on a dummy
+        forward that reaches this same point on every EP rank).
+        """
+        ascend_config = get_ascend_config()
+        if not _ZERCMOE_STATE["lib_loaded"]:
+            lib_path = ascend_config.zercmoe_lib_path
+            if not lib_path:
+                raise RuntimeError(
+                    "enable_fused_mc2=2 (ZercMoE) requires additional_config.zercmoe_lib_path "
+                    "pointing to libdispatch_gmm_ops.so (or env VLLM_ASCEND_ZERCMOE_LIB_PATH)."
+                )
+            torch.ops.load_library(lib_path)
+            _ZERCMOE_STATE["lib_loaded"] = True
+
+        if not _ZERCMOE_STATE["initialized"]:
+            group = get_mc2_group()
+            rank = group.rank_in_group
+            world_size = group.world_size
+            device_id = torch.npu.current_device()
+            logger.info(
+                "ZercMoE dispatch_gmm_init: rank=%d world=%d ipport=%s device=%d mem=%dMB",
+                rank,
+                world_size,
+                ascend_config.zercmoe_ipport,
+                device_id,
+                ascend_config.zercmoe_mem_size_mb,
+            )
+            torch.ops.npu.dispatch_gmm_init(
+                rank,
+                world_size,
+                ascend_config.zercmoe_ipport,
+                device_id,
+                ascend_config.zercmoe_mem_size_mb,
+            )
+            _ZERCMOE_STATE["initialized"] = True
+
+    def _apply_zercmoe(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+    ):
+        """ZercMoE fused dispatch+FFN+combine (bf16, full-width SiLU).
+
+        Weights arrive pre-packed from UnquantizedFusedMoEMethod:
+        w1/w2 are 1-D zN-flattened bf16 tensors and w1_scale/w2_scale are the
+        int64 [E, n] / [E, k] dummies the op uses for shape derivation.
+        Semantics follow the ZercMoE kernel as-is (no SwiGLU alignment).
+        """
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        # ZercMoE's routing table layout assumes a uniform per-rank token count
+        # (rankOffset = rank * m * topK); the non-uniform DP-chunked mode is
+        # not supported.
+        if self.token_dispatcher.global_bs != 0:
+            raise RuntimeError(
+                "ZercMoE backend requires uniform token counts across EP ranks "
+                "(global_bs != 0, i.e. non-uniform DP-chunked mode, is not supported)."
+            )
+        if fused_experts_input.routing.global_redundant_expert_num != 0:
+            raise RuntimeError("ZercMoE backend does not support global redundant experts (EPLB).")
+
+        self._init_zercmoe()
+
+        hidden_states = fused_experts_input.hidden_states
+        if hidden_states.dtype != torch.bfloat16:
+            raise RuntimeError(f"ZercMoE backend requires bf16 hidden_states, got {hidden_states.dtype}.")
+        hidden_states = hidden_states.contiguous()
+        topk_ids = fused_experts_input.topk_ids.to(torch.int32).contiguous()
+        topk_weights = fused_experts_input.topk_weights.to(torch.float32).contiguous()
+
+        out = torch.ops.npu.dispatch_gmm_combine(
+            hidden_states,
+            fused_experts_input.weights.w1,
+            fused_experts_input.weights.w2,
+            fused_experts_input.weights.w1_scale,
+            fused_experts_input.weights.w2_scale,
+            topk_ids,
+            topk_weights,
+            self.moe_config.num_local_experts,
+            self.moe_config.experts_per_token,
+            1,  # weight_nz: weights pre-packed into ZercMoE zN layout
+            0,  # trans_b
+        )
+        # NOTE: dispatch_gmm_finalize is intentionally not invoked per step;
+        # the SHMEM session lives for the whole process.
+        return out, None
+
     def fused_experts(
         self,
         fused_experts_input: MoEFusedExpertsInput,
@@ -423,6 +519,13 @@ class FusedMC2CommImpl(MoECommMethod):
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
+
+        if get_ascend_config().enable_fused_mc2 == 2:
+            out, expert_tokens = self._apply_zercmoe(fused_experts_input)
+            return FusedExpertsResult(
+                routed_out=out,
+                expert_tokens=expert_tokens,
+            )
 
         expert_tokens = None
         if get_ascend_config().enable_fused_mc2 == 1:

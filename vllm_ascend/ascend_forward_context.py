@@ -283,11 +283,41 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
+def _zercmoe_supported_by_config(vllm_config: VllmConfig) -> bool:
+    """ZercMoE (enable_fused_mc2 == 2) supports bf16 unquantized models only."""
+    hf_text_config = vllm_config.model_config.hf_text_config
+    quant_type = getattr(
+        hf_text_config,
+        "moe_quantize",
+        getattr(hf_text_config, "quantize", None),
+    )
+    if quant_type is not None:
+        quant_name = str(getattr(quant_type, "name", quant_type)).lower()
+        if quant_name not in ("", "none"):
+            return False
+    hidden_size = getattr(hf_text_config, "hidden_size", None)
+    if hidden_size is None and hasattr(vllm_config.model_config, "get_hidden_size"):
+        hidden_size = vllm_config.model_config.get_hidden_size()
+    if hidden_size is None:
+        return False
+    # ZercMoE zN packing requires the hidden dim to be a multiple of 16.
+    return int(hidden_size) % 16 == 0
+
+
 def _select_a2_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
 ) -> MoECommType:
+    if get_ascend_config().enable_fused_mc2 == 2:
+        # ZercMoE backend: bf16-only fused dispatch+FFN+combine op loaded from
+        # libdispatch_gmm_ops.so (see additional_config.zercmoe_lib_path).
+        if _zercmoe_supported_by_config(vllm_config):
+            return MoECommType.FUSED_MC2
+        logger.warning_once(
+            "enable_fused_mc2=2 (ZercMoE) requires an unquantized model with "
+            "hidden_size % 16 == 0. Falling back to MC2/ALLGATHER."
+        )
     if get_ascend_config().enable_fused_mc2 == 1:
         # On A2 the fused path relies on the CANN mega_moe op from
         # cann_ops_transformer only. The dispatch_ffn_combine fallback is an
