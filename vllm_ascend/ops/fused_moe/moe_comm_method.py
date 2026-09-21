@@ -901,6 +901,11 @@ class ZercMoECommImpl(MoECommMethod):
         # zercmoe.mega_moe: signature aligned with cann_ops_transformer's
         # mega_moe; auto_pack passes pre-packed 1D weights through (fast path).
         # ZR-unsupported kwargs are None-only validated inside the package.
+        # return_expert_tokens=0: skip the per-call stream sync and the
+        # expert_token_nums D2H/H2D round trip — nothing in the ZERC_MOE path
+        # consumes them (dynamic EPLB is excluded by the gate), so the CPU can
+        # run ahead and prefill launches stay pipelined. expert_tokens is
+        # returned as an empty tensor.
         y, expert_tokens = self._zercmoe.mega_moe(
             x,
             topk_ids.to(torch.int32),
@@ -908,6 +913,7 @@ class ZercMoECommImpl(MoECommMethod):
             fused_experts_input.weights.w1,
             fused_experts_input.weights.w2,
             self.zercmoe_symm_buffer,
+            return_expert_tokens=0,
         )
         return y, expert_tokens
 
