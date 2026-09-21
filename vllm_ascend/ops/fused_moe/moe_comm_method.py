@@ -587,10 +587,12 @@ def early_init_zercmoe(vllm_config) -> None:
     Stores the symm buffer in ``_ZERCMOE_EARLY_SYM_BUFFER``;
     ``ZercMoECommImpl._lazy_init_zercmoe`` picks it up later (skipping the
     lazy path). Falls through silently if the gate is off or the mc2
-    capacity is not yet set.
+    capacity is not yet set. Each decision point is logged so the
+    init execution status can be confirmed from the vllm log alone.
     """
     global _ZERCMOE_EARLY_SYM_BUFFER
     if _ZERCMOE_EARLY_SYM_BUFFER is not None:
+        logger.info("ZercMoE early init: already initialized, skip.")
         return
 
     from vllm_ascend.ascend_forward_context import (
@@ -600,7 +602,10 @@ def early_init_zercmoe(vllm_config) -> None:
     from vllm_ascend.distributed.parallel_state import get_mc2_group
 
     if not use_cann_zercmoe(vllm_config):
+        logger.info("ZercMoE early init: gate off, skipped.")
         return
+
+    logger.info("ZercMoE early init: gate passed, starting SHMEM bootstrap.")
 
     mc2_group = get_mc2_group()
     ep_world_size = mc2_group.world_size
@@ -610,6 +615,10 @@ def early_init_zercmoe(vllm_config) -> None:
     num_max_tokens = (mc2_cap // tp_size) if mc2_cap else 0
     if num_max_tokens <= 0:
         # mc2 capacity not yet set; skip (lazy init will handle later).
+        logger.info(
+            "ZercMoE early init: mc2 capacity not set yet (cap=%s), deferring to lazy init.",
+            mc2_cap,
+        )
         return
 
     hf = vllm_config.model_config.hf_text_config
@@ -640,19 +649,78 @@ def early_init_zercmoe(vllm_config) -> None:
         ipport,
         mem_mb,
     )
-    _ZERCMOE_EARLY_SYM_BUFFER = _ZercMoeSymmBuffer(
-        moe_expert_num=moe_expert_num,
-        ep_world_size=ep_world_size,
-        ep_rank=ep_rank,
-        num_max_tokens_per_rank=num_max_tokens,
-        num_topk=num_topk,
-        hidden=hidden,
-        intermediate_hidden=intermediate_hidden,
-        ipport=ipport,
-        device_id=torch.npu.current_device(),
-        mem_size_mb=mem_mb,
-    )
-    logger.info("ZercMoE early init success.")
+
+    # Symbol-interposition guard (optimization 7): memfabric_hybrid's
+    # libmf_hybm_core.so exports the same hybm symbols as zercmoe's
+    # libshmem.so; if it was loaded earlier in this process, the PLT calls
+    # inside libshmem resolve to it and aclshmemx_init_attr fails with
+    # ACLSHMEM_INNER_ERROR (-4). Detect and diagnose precisely instead of
+    # leaving an opaque rc=-1.
+    with open("/proc/self/maps") as maps_file:
+        maps_content = maps_file.read()
+    if "libmf_hybm" in maps_content:
+        logger.error(
+            "ZercMoE early init: libmf_hybm_core.so (memfabric_hybrid) is "
+            "loaded in this process BEFORE zercmoe init. Its hybm symbols "
+            "(HybmGetInitDeviceId etc.) interpose libshmem's PLT calls and "
+            "break SHMEM init. Check for new module-level imports of "
+            "memfabric_hybrid in the vllm-ascend import graph (known chains: "
+            "sparse_kv_offload_manager via sfa_v1/sfa_cp/model_runner_v1/"
+            "llm_base_proposer - all deferred)."
+        )
+    try:
+        _ZERCMOE_EARLY_SYM_BUFFER = _ZercMoeSymmBuffer(
+            moe_expert_num=moe_expert_num,
+            ep_world_size=ep_world_size,
+            ep_rank=ep_rank,
+            num_max_tokens_per_rank=num_max_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+            ipport=ipport,
+            device_id=torch.npu.current_device(),
+            mem_size_mb=mem_mb,
+        )
+    except Exception as e:
+        # Optimization 8: the SHMEM library logs its own failure detail
+        # (hybm_import / SetThreadAclDevice etc.) to $HOME/shmem/log/, which
+        # the user never sees. Surface the tail into the vllm log so the
+        # root cause is visible without hunting for the side log file.
+        logger.error("ZercMoE early init FAILED: %s", e)
+        _log_shmem_side_log_tail()
+        raise
+    logger.info("ZercMoE early init success (SHMEM transport ready).")
+
+
+def _log_shmem_side_log_tail(tail_lines: int = 6) -> None:
+    """Dump the tail of this process's SHMEM side log into the vllm log.
+
+    The SHMEM library (aclshmem) logs init details to
+    ``~/shmem/log/aclshmem_<pid>_<ts>.log``; on failure the user only sees
+    ``rc=-1`` in the vllm log. Surfacing the last lines makes the root cause
+    (e.g. 'hybm import failed' / 'Set device id to be -1') immediately
+    visible.
+    """
+    import glob
+    import os as _os
+
+    from vllm.logger import logger
+
+    home = _os.path.expanduser("~")
+    pattern = _os.path.join(home, "shmem", "log", f"aclshmem_{_os.getpid()}_*.log")
+    candidates = sorted(glob.glob(pattern), key=lambda p: _os.path.getmtime(p))
+    if not candidates:
+        logger.info("ZercMoE SHMEM side log not found for pid %s (no logs written).", _os.getpid())
+        return
+    side_log = candidates[-1]
+    try:
+        with open(side_log) as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.info("ZercMoE SHMEM side log %s unreadable: %s", side_log, e)
+        return
+    tail = "".join(lines[-tail_lines:]).rstrip()
+    logger.error("ZercMoE SHMEM side log (%s) tail:\n%s", side_log, tail)
 
 
 class _ZercMoeSymmBuffer:
@@ -781,22 +849,36 @@ class ZercMoECommImpl(MoECommMethod):
             ipport,
             mem_mb,
         )
+        # Symbol-interposition guard: see early_init_zercmoe.
+        with open("/proc/self/maps") as maps_file:
+            if "libmf_hybm" in maps_file.read():
+                logger.error(
+                    "ZercMoE lazy init: libmf_hybm_core.so is loaded in this "
+                    "process; its hybm symbols interpose libshmem's PLT calls "
+                    "and will break SHMEM init. Check for new module-level "
+                    "imports of memfabric_hybrid."
+                )
         # Bypass the wheel's SymmBuffer (which binds the SHMEM pe to the
         # RANK/WORLD_SIZE env vars that vLLM workers do not set) and call
         # dispatch_gmm_init directly with the authoritative mc2 rank. The
         # duck-typed shim exposes the attributes zercmoe.mega_moe reads.
-        self.zercmoe_symm_buffer = _ZercMoeSymmBuffer(
-            moe_expert_num=self.moe_config.num_experts,
-            ep_world_size=self.token_dispatcher.ep_world_size,
-            ep_rank=self.token_dispatcher.ep_rank_id,
-            num_max_tokens_per_rank=num_max_tokens,
-            num_topk=self.moe_config.experts_per_token,
-            hidden=self.moe_config.hidden_dim,
-            intermediate_hidden=self.moe_config.intermediate_size_per_partition,
-            ipport=ipport,
-            device_id=torch.npu.current_device(),
-            mem_size_mb=mem_mb,
-        )
+        try:
+            self.zercmoe_symm_buffer = _ZercMoeSymmBuffer(
+                moe_expert_num=self.moe_config.num_experts,
+                ep_world_size=self.token_dispatcher.ep_world_size,
+                ep_rank=self.token_dispatcher.ep_rank_id,
+                num_max_tokens_per_rank=num_max_tokens,
+                num_topk=self.moe_config.experts_per_token,
+                hidden=self.moe_config.hidden_dim,
+                intermediate_hidden=self.moe_config.intermediate_size_per_partition,
+                ipport=ipport,
+                device_id=torch.npu.current_device(),
+                mem_size_mb=mem_mb,
+            )
+        except Exception as e:
+            logger.error("ZercMoE lazy init FAILED: %s", e)
+            _log_shmem_side_log_tail()
+            raise
         # Lifecycle (MegaMoe-style): sym_buffer.destroy() is NEVER called -
         # aclrtResetDevice never executes, SHMEM resources are reclaimed at
         # process exit, and the ranks avoid destroy's exit barrier (an
