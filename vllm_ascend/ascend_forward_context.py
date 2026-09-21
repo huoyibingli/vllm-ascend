@@ -37,6 +37,12 @@ class MoECommType(Enum):
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 4096
+# ZercMoE supports a larger per-rank m than MegaMoe: its symmetric heap is
+# sized by formula (scales with m * topK * hidden) instead of a fixed
+# pre-registered buffer, and the dispatch-staging region (430MB) leaves >25x
+# headroom at m=4096/hidden=8192. The 4096 default still applies unless the
+# heap formula grows with it.
+_ZERC_MOE_TOKENS_PER_RANK_LIMIT = 8192
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
 
@@ -309,7 +315,9 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
     # keep the num_tokens_per_tp_rank less than fused_mc2 (mega_moe) tokens per rank limit
     if ascend_config.enable_fused_mc2:
-        if use_mega_moe or use_zerc_moe:
+        if use_zerc_moe:
+            num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _ZERC_MOE_TOKENS_PER_RANK_LIMIT)
+        elif use_mega_moe:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT)
         else:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT)

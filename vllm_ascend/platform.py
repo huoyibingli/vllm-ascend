@@ -503,28 +503,27 @@ class NPUPlatform(Platform):
 
         from vllm.config.compilation import CUDAGraphMode
 
-        # ZercMoE: force graph mode off while the ZERC_MOE branch is active.
-        # zerc_moe host-syncs the stream and lazy-inits the SHMEM transport
-        # per call; both are illegal inside graph capture. A2 keeps ZERC_MOE
-        # prefill-only so FULL_DECODE_ONLY graphs would technically be safe,
-        # but v1 disables all graph modes for defense-in-depth and to remove
-        # graph mode as a test variable. May be relaxed to keep
-        # FULL_DECODE_ONLY after E2E validation.
+        # ZercMoE: zerc_moe host-syncs the stream and lazy-inits the SHMEM
+        # transport per call; both are illegal inside graph capture. The
+        # A2 ZERC_MOE path is prefill-only, so decode-only graphs
+        # (FULL_DECODE_ONLY/PIECEWISE) never contain zerc_moe and stay safe;
+        # only demote modes that capture prefill (FULL) down to
+        # FULL_DECODE_ONLY, which keeps the decode graph benefit.
         if (
             ascend_config.enable_zerc_moe == 1
             and ascend_config.enable_fused_mc2 == 1
-            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and compilation_config.cudagraph_mode == CUDAGraphMode.FULL
             and _zercmoe_config_time_gate(vllm_config, ascend_config)
         ):
             logger.warning_once(
-                "Disabling cudagraph mode (%s) because the ZERC_MOE branch is "
-                "enabled for this config (zerc_moe host-syncs and lazy-inits "
-                "inside the op, which cannot be graph-captured). Set "
-                "additional_config.enable_zerc_moe=0 (or uninstall the zercmoe "
-                "wheel) to keep graph mode.",
-                compilation_config.cudagraph_mode,
+                "Demoting cudagraph mode from FULL to FULL_DECODE_ONLY "
+                "because the ZERC_MOE branch is enabled for this config "
+                "(zerc_moe runs on prefill and host-syncs/lazy-inits inside "
+                "the op, which cannot be graph-captured). Decode graphs are "
+                "kept: on A2 decode uses the ALLGATHER path and never runs "
+                "zerc_moe."
             )
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
         if ascend_config.xlite_graph_config.enabled:
             if ascend_config.xlite_graph_config.full_mode and vllm_config.speculative_config is None:
