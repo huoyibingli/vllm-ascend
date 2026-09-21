@@ -39,11 +39,12 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
-    OFFLOAD_K_CACHE_NPU_INDEX,
-    OFFLOAD_KV_CACHE_TUPLE_LEN,
-    OFFLOAD_V_CACHE_NPU_INDEX,
-)
+
+# NOTE: sparse_kv_offload_manager's module-level `from memfabric_hybrid import
+# offload` loads libmf_hybm_core.so, which exports hybm symbols that interpose
+# the PLT-resolved calls inside zercmoe's libshmem.so (breaks ZercMoE SHMEM
+# init with ACLSHMEM_INNER_ERROR -4). Its constants are lazily imported at the
+# single use site (search OFFLOAD_KV_CACHE_TUPLE_LEN below).
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
@@ -1794,6 +1795,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Sparse KV offload registers the main MLA cache as a 6-tuple
         # (k_npu, v_npu, k_cpu, v_cpu, topk_buffer_k, topk_buffer_v); the
         # attention kernels only consume the leading NPU pair.
+        # Lazy import: keeps memfabric_hybrid (libmf_hybm_core.so) out of the
+        # process unless sparse KV offload is active; see the note at the top.
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+            OFFLOAD_K_CACHE_NPU_INDEX,
+            OFFLOAD_KV_CACHE_TUPLE_LEN,
+            OFFLOAD_V_CACHE_NPU_INDEX,
+        )
+
         if len(main_cache) == OFFLOAD_KV_CACHE_TUPLE_LEN:
             main_cache = (main_cache[OFFLOAD_K_CACHE_NPU_INDEX], main_cache[OFFLOAD_V_CACHE_NPU_INDEX])
 

@@ -134,13 +134,14 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
-    allocate_kv_cache_tensors_for_sparse_kv_offload,
-    allocate_kv_offload_topk_profile_buffers,
-    init_sparse_kv_offload_manager,
-    reshape_kv_cache_tensors_for_sparse_kv_offload,
-    update_sparse_kv_offload_metadata,
-)
+
+# NOTE: sparse_kv_offload_manager (and its memfabric_hybrid dependency) is
+# lazily imported inside the sparse-KV-offload methods below. Its module-level
+# `from memfabric_hybrid import offload` loads libmf_hybm_core.so, which
+# exports hybm symbols (HybmGetInitDeviceId etc.) that would interpose the
+# PLT-resolved calls inside zercmoe's libshmem.so, breaking the ZercMoE SHMEM
+# init (ACLSHMEM_INNER_ERROR -4). Deferring the import keeps libmf_hybm_core.so
+# out of the process unless sparse KV offload is actually enabled (default off).
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
@@ -2897,6 +2898,9 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         if self.sparse_kv_offload_enabled:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                update_sparse_kv_offload_metadata,
+            )
             update_sparse_kv_offload_metadata(
                 num_tokens,
                 num_reqs,
@@ -3575,6 +3579,9 @@ class NPUModelRunner(GPUModelRunner):
     def profile_run(self) -> None:
         self.eplb_warmup()
         if self.sparse_kv_offload_enabled:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                allocate_kv_offload_topk_profile_buffers,
+            )
             allocate_kv_offload_topk_profile_buffers(
                 getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec(),
                 self.vllm_config,
@@ -3584,7 +3591,7 @@ class NPUModelRunner(GPUModelRunner):
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config, in_profile_run=True
-        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+        ) in {MoECommType.MC2, MoECommType.FUSED_MC2, MoECommType.ZERC_MOE}:
             # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
             with disable_compilation(self.get_model()):
                 self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
@@ -3783,6 +3790,9 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         if self.sparse_kv_offload_enabled:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                init_sparse_kv_offload_manager,
+            )
             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
                 self.vllm_config,
                 kv_cache_config,
@@ -4181,6 +4191,9 @@ class NPUModelRunner(GPUModelRunner):
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
                         assert v_tensor_size is not None
+                        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                            allocate_kv_cache_tensors_for_sparse_kv_offload,
+                        )
                         raw_tensors = allocate_kv_cache_tensors_for_sparse_kv_offload(
                             k_tensor_size,
                             v_tensor_size,
@@ -4389,6 +4402,9 @@ class NPUModelRunner(GPUModelRunner):
                     if self.sparse_kv_offload_enabled:
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
+                        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                            reshape_kv_cache_tensors_for_sparse_kv_offload,
+                        )
                         reshaped_tensors = reshape_kv_cache_tensors_for_sparse_kv_offload(
                             kv_cache_raw_tensors[layer_name],
                             current_kv_cache_spec,

@@ -124,6 +124,39 @@ def prune_capture_sizes_for_950(vllm_config):
     )
 
 
+def _zercmoe_config_time_gate(vllm_config, ascend_config) -> bool:
+    """Config-time approximation of use_cann_zercmoe (ascend_forward_context).
+
+    Used only for early decisions such as disabling graph modes; the
+    per-forward gate remains authoritative. Must never be broader than it, so
+    that graph mode is untouched whenever zercmoe will not actually run.
+    """
+    from vllm_ascend.ascend_config import is_zercmoe_supported_by_config
+    from vllm_ascend.ops.fused_moe.comm_utils import zercmoe_lib_available
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+    parallel_config = vllm_config.parallel_config
+    if not parallel_config.enable_expert_parallel:
+        return False
+    if parallel_config.pipeline_parallel_size != 1:
+        return False
+    world_size = parallel_config.world_size or (
+        parallel_config.tensor_parallel_size
+        * parallel_config.data_parallel_size
+        * parallel_config.pipeline_parallel_size
+    )
+    ep_world_size = world_size // parallel_config.pipeline_parallel_size
+    return (
+        zercmoe_lib_available()
+        and get_ascend_device_type() == AscendDeviceType.A2
+        and 1 < ep_world_size <= 64
+        and getattr(vllm_config, "lora_config", None) is None
+        and vllm_config.model_config.dtype == torch.bfloat16
+        and not ascend_config.eplb_config.dynamic_eplb
+        and is_zercmoe_supported_by_config(vllm_config)
+    )
+
+
 class NPUPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "npu"
@@ -469,6 +502,29 @@ class NPUPlatform(Platform):
         enforce_eager = getattr(model_config, "enforce_eager", False)
 
         from vllm.config.compilation import CUDAGraphMode
+
+        # ZercMoE: force graph mode off while the ZERC_MOE branch is active.
+        # zerc_moe host-syncs the stream and lazy-inits the SHMEM transport
+        # per call; both are illegal inside graph capture. A2 keeps ZERC_MOE
+        # prefill-only so FULL_DECODE_ONLY graphs would technically be safe,
+        # but v1 disables all graph modes for defense-in-depth and to remove
+        # graph mode as a test variable. May be relaxed to keep
+        # FULL_DECODE_ONLY after E2E validation.
+        if (
+            ascend_config.enable_zerc_moe == 1
+            and ascend_config.enable_fused_mc2 == 1
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and _zercmoe_config_time_gate(vllm_config, ascend_config)
+        ):
+            logger.warning_once(
+                "Disabling cudagraph mode (%s) because the ZERC_MOE branch is "
+                "enabled for this config (zerc_moe host-syncs and lazy-inits "
+                "inside the op, which cannot be graph-captured). Set "
+                "additional_config.enable_zerc_moe=0 (or uninstall the zercmoe "
+                "wheel) to keep graph mode.",
+                compilation_config.cudagraph_mode,
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
         if ascend_config.xlite_graph_config.enabled:
             if ascend_config.xlite_graph_config.full_mode and vllm_config.speculative_config is None:

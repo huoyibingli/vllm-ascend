@@ -1200,6 +1200,7 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     from vllm_ascend.ascend_forward_context import (
         select_moe_comm_method,
         use_cann_megamoe,
+        use_cann_zercmoe,
     )
     from vllm_ascend.ops.fused_moe.moe_comm_method import MoECommType
 
@@ -1211,10 +1212,12 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
         scheduler_config.max_num_batched_tokens, vllm_config, is_draft_model=is_draft_model
     )
 
-    if use_cann_megamoe(vllm_config):
+    # MegaMoe/ZercMoE both require uniform token counts across ranks (their
+    # FUSED_MC2/ZERC_MOE paths cannot skip).
+    if use_cann_megamoe(vllm_config) or use_cann_zercmoe(vllm_config):
         return False
 
-    mc2_comm_methods = {MoECommType.MC2, MoECommType.FUSED_MC2}
+    mc2_comm_methods = {MoECommType.MC2, MoECommType.FUSED_MC2, MoECommType.ZERC_MOE}
     # if mc2 is used in decode max potential tokens case, we can skip allreduce in decode only case.
     decode_can_skip = decode_comm_method in mc2_comm_methods
     # if mc2 is used in prefill max potential tokens case and prefill and decode have the same cudagraph mode,

@@ -67,9 +67,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     get_gva_layerwise_config,
     get_layerwise_physical_layer_index,
 )
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
-    get_host_device_memory_usage_ratio,
-)
+
+# NOTE: sparse_kv_offload_manager (and its memfabric_hybrid dependency) is
+# lazily imported below. Its module-level `from memfabric_hybrid import offload`
+# loads libmf_hybm_core.so, which exports hybm symbols (HybmGetInitDeviceId etc.)
+# that would interpose the PLT-resolved calls inside zercmoe's libshmem.so,
+# breaking the ZercMoE SHMEM init (ACLSHMEM_INNER_ERROR -4). Deferring the
+# import keeps libmf_hybm_core.so out of the process unless sparse KV offload
+# is actually enabled (default off).
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -507,6 +512,15 @@ class NPUWorker(WorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+        # Early-init ZercMoE SHMEM transport before model loading. The SHMEM
+        # init (aclshmemx_init_attr -> hybm_import) fails inside heavily-loaded
+        # worker processes (post model-load); running it here (post-distributed,
+        # pre-model-load) mirrors the torchrun reference usage and avoids the
+        # issue. No-op when ZERC_MOE is not enabled.
+        from vllm_ascend.ops.fused_moe.moe_comm_method import early_init_zercmoe
+
+        early_init_zercmoe(self.vllm_config)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -616,6 +630,12 @@ class NPUWorker(WorkerBase):
         sparse_kv_offload_config = get_ascend_config().sparse_kv_offload_config
         if not sparse_kv_offload_config.enabled:
             return available_memory
+        # Lazy import: avoids loading memfabric_hybrid (libmf_hybm_core.so)
+        # at module import time; see the note near the top of this file.
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+            get_host_device_memory_usage_ratio,
+        )
+
         keep_device_kv_cache = sparse_kv_offload_config.keep_device_kv_cache
         if keep_device_kv_cache:
             needed_dram_size_bytes = available_memory

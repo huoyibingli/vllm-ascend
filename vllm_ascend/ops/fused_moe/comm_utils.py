@@ -16,6 +16,7 @@
 # limitations under the License.
 #
 from importlib import import_module
+from importlib import util as importlib_util
 
 import torch
 import torch.distributed
@@ -141,3 +142,51 @@ def _get_cann_mega_moe_quant_settings(quant_type: QuantType) -> tuple[int, int |
     raise RuntimeError(
         f"MegaMoe integration supports W8A8/W4A8/BF16 on A2/A3 MegaMoe platforms. Unsupported quant type: {quant_type}."
     )
+
+
+_ZERCMOE_MODULE = None
+_ZERCMOE_IMPORT_ATTEMPTED = False
+
+
+def zercmoe_lib_available() -> bool:
+    """Presence check for the zercmoe wheel WITHOUT importing it.
+
+    Deliberately does not execute the package: importing zercmoe loads the
+    bundled SHMEM libraries, and doing that in a long-lived parent process
+    (the vLLM API server, before the EngineCore/Worker fork chain) leaves the
+    forked children with inherited SHMEM library state, after which
+    aclshmemx_init_attr fails with ACLSHMEM_INNER_ERROR (-4). The real import
+    happens per worker process in load_zercmoe_ops(), mirroring the
+    torchrun-based reference usage of the wheel.
+    """
+    return importlib_util.find_spec("zercmoe") is not None
+
+
+def load_zercmoe_ops():
+    """Import the zercmoe package once (worker processes only); return the module or None.
+
+    Importing zercmoe loads the bundled kernel/launcher/SHMEM libraries
+    (dependencies preloaded RTLD_GLOBAL by the package, no LD_LIBRARY_PATH).
+    Must only be called from forked worker processes, never from the API
+    server / EngineCore parent (see zercmoe_lib_available). None (wheel not
+    installed / import failed) disables ZERC_MOE and the gate falls back to
+    the legacy FUSED_MC2 path.
+    """
+    global _ZERCMOE_MODULE, _ZERCMOE_IMPORT_ATTEMPTED
+    if _ZERCMOE_IMPORT_ATTEMPTED:
+        return _ZERCMOE_MODULE
+    _ZERCMOE_IMPORT_ATTEMPTED = True
+    from vllm.logger import logger
+
+    try:
+        import zercmoe
+
+        _ZERCMOE_MODULE = zercmoe
+    except Exception as e:  # noqa: BLE001
+        logger.warning_once(
+            "Failed to import zercmoe (%s). ZERC_MOE is disabled; install the "
+            "zercmoe wheel or set VLLM_ASCEND_ENABLE_ZERC_MOE=0 to silence this.",
+            e,
+        )
+        _ZERCMOE_MODULE = None
+    return _ZERCMOE_MODULE

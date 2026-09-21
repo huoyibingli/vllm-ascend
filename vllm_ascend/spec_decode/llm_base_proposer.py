@@ -47,9 +47,12 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
-    prepare_sparse_kv_offload_mtp_dummy_metadata,
-)
+
+# NOTE: sparse_kv_offload_manager's module-level `from memfabric_hybrid import
+# offload` loads libmf_hybm_core.so, which exports hybm symbols that interpose
+# the PLT-resolved calls inside zercmoe's libshmem.so (breaks ZercMoE SHMEM
+# init). Its helper is lazily imported at the single use site (search
+# prepare_sparse_kv_offload_mtp_dummy_metadata below).
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.deepseek_v4_dspark import DSparkDeepseekV4ForCausalLM
 from vllm_ascend.models.kimi_k3_dspark import K3DSparkForCausalLM
@@ -793,6 +796,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # num_reqs is already the padded version
                 self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
                 self.query_start_loc.copy_to_gpu()
+                # Lazy import: keeps memfabric_hybrid out of the process; see
+                # the import note near the top of this file.
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                    prepare_sparse_kv_offload_mtp_dummy_metadata,
+                )
+
                 req_ids_tensor, token_to_req = prepare_sparse_kv_offload_mtp_dummy_metadata(
                     num_tokens,
                     num_reqs,

@@ -11,7 +11,12 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
-from vllm_ascend.ascend_config import _CANN_OPS_TRANSFORMER_AVAILABLE, get_ascend_config, is_megamoe_supported_by_config
+from vllm_ascend.ascend_config import (
+    _CANN_OPS_TRANSFORMER_AVAILABLE,
+    get_ascend_config,
+    is_megamoe_supported_by_config,
+    is_zercmoe_supported_by_config,
+)
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -27,6 +32,7 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+    ZERC_MOE = 4
 
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
@@ -95,6 +101,36 @@ def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
     )
 
 
+def use_cann_zercmoe(vllm_config: VllmConfig) -> bool:
+    """Whether the ZercMoE fused op can be used for this config.
+
+    ZercMoE (dispatch_gmm_combine_zero_redundant, zercmoe wheel) is bf16-only
+    and takes priority over MegaMoe on A2 prefill when enabled; otherwise the
+    legacy FUSED_MC2 path is used unchanged. The kernel assumes uniform token
+    counts across EP ranks; this is guaranteed at config level by
+    should_skip_allreduce_across_dp_group() returning False for zercmoe
+    configs (mirroring the MegaMoe precedent). PP must be 1 because the
+    zercmoe SymmBuffer binds the SHMEM pe to the global RANK env and asserts
+    WORLD_SIZE == ep_world_size.
+    """
+    from vllm_ascend.ops.fused_moe.comm_utils import zercmoe_lib_available
+
+    return (
+        get_ascend_config().enable_zerc_moe == 1
+        and get_ascend_config().enable_fused_mc2 == 1
+        and zercmoe_lib_available()
+        and get_ascend_device_type() == AscendDeviceType.A2
+        and is_moe_model(vllm_config)
+        and vllm_config.parallel_config.enable_expert_parallel
+        and vllm_config.parallel_config.pipeline_parallel_size == 1
+        and 1 < get_ep_group().world_size <= 64
+        and getattr(vllm_config, "lora_config", None) is None
+        and vllm_config.model_config.dtype == torch.bfloat16
+        and not get_ascend_config().eplb_config.dynamic_eplb
+        and is_zercmoe_supported_by_config(vllm_config)
+    )
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -147,6 +183,7 @@ def set_ascend_forward_context(
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
         forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
+        forward_context.use_zerc_moe = use_cann_zercmoe(vllm_config)
         forward_context.is_decode_only_node = _is_decode_only_node(vllm_config)
 
         tp_world_size = get_tensor_model_parallel_world_size()
@@ -257,9 +294,10 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
 
     ascend_config = get_ascend_config()
     use_mega_moe = use_cann_megamoe(vllm_config)
+    use_zerc_moe = use_cann_zercmoe(vllm_config)
     is_decode_only_node = _is_decode_only_node(vllm_config)
 
-    if ascend_config.enable_prefill_mc2 or (use_mega_moe and not is_decode_only_node):
+    if ascend_config.enable_prefill_mc2 or ((use_mega_moe or use_zerc_moe) and not is_decode_only_node):
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     elif vllm_config.compilation_config.cudagraph_capture_sizes:
         max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
@@ -271,7 +309,7 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
     # keep the num_tokens_per_tp_rank less than fused_mc2 (mega_moe) tokens per rank limit
     if ascend_config.enable_fused_mc2:
-        if use_mega_moe:
+        if use_mega_moe or use_zerc_moe:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT)
         else:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT)
@@ -345,12 +383,15 @@ def _select_a2_moe_comm_method(
     # prefill batches where the communication savings outweigh the overhead.
     # Very small prefills (<=64 tokens) fall through to ALLGATHER.
     _MEGAMOE_PREFILL_TOKEN_THRESHOLD = 64
-    if (
-        (is_prefill or in_profile_run)
-        and get_ascend_config().enable_fused_mc2 == 1
-        and (in_profile_run or (num_tokens is not None and num_tokens > _MEGAMOE_PREFILL_TOKEN_THRESHOLD))
+    if (is_prefill or in_profile_run) and (
+        in_profile_run or (num_tokens is not None and num_tokens > _MEGAMOE_PREFILL_TOKEN_THRESHOLD)
     ):
-        return MoECommType.FUSED_MC2
+        # ZercMoE takes priority over the legacy FUSED_MC2 (mega_moe /
+        # dispatch_ffn_combine) path for bf16 models when enabled.
+        if use_cann_zercmoe(vllm_config):
+            return MoECommType.ZERC_MOE
+        if get_ascend_config().enable_fused_mc2 == 1:
+            return MoECommType.FUSED_MC2
 
     if num_experts > 512:
         return MoECommType.ALLGATHER
@@ -556,6 +597,7 @@ class _ExtraForwardContextProxy:
         "moe_comm_type",
         "moe_comm_method",
         "use_mega_moe",
+        "use_zerc_moe",
         "is_decode_only_node",
         "mmrs_fusion",
         "num_tokens",

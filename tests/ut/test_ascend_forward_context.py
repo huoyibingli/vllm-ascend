@@ -14,7 +14,7 @@ def reset_mc2_tokens_capacity(monkeypatch):
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
-        lambda: SimpleNamespace(enable_prefill_mc2=False, enable_fused_mc2=0),
+        lambda: SimpleNamespace(enable_prefill_mc2=False, enable_fused_mc2=0, enable_zerc_moe=0),
     )
 
 
@@ -94,7 +94,9 @@ def _patch_select_moe_comm_method_deps(
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
-        lambda: SimpleNamespace(enable_fused_mc2=enable_fused_mc2, enable_prefill_mc2=enable_prefill_mc2),
+        lambda: SimpleNamespace(
+            enable_fused_mc2=enable_fused_mc2, enable_prefill_mc2=enable_prefill_mc2, enable_zerc_moe=0
+        ),
     )
 
 
@@ -122,7 +124,7 @@ def test_set_mc2_tokens_capacity_prefill_mc2_uses_max_num_batched_tokens(monkeyp
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
-        lambda: SimpleNamespace(enable_prefill_mc2=True, enable_fused_mc2=0),
+        lambda: SimpleNamespace(enable_prefill_mc2=True, enable_fused_mc2=0, enable_zerc_moe=0),
     )
     vllm_config = _make_vllm_config(tensor_parallel_size=8, max_num_batched_tokens=513)
 
@@ -133,6 +135,7 @@ def test_set_mc2_tokens_capacity_prefill_mc2_uses_max_num_batched_tokens(monkeyp
 
 def test_set_mc2_tokens_capacity_decode_only_uses_cudagraph_capture_size(monkeypatch):
     monkeypatch.setattr(afc, "use_cann_megamoe", lambda _: True)
+    monkeypatch.setattr(afc, "use_cann_zercmoe", lambda _: False)
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
@@ -158,6 +161,7 @@ def test_set_mc2_tokens_capacity_decode_only_uses_cudagraph_capture_size(monkeyp
 
 def test_set_mc2_tokens_capacity_decode_only_without_cudagraph_uses_decode_shape(monkeypatch):
     monkeypatch.setattr(afc, "use_cann_megamoe", lambda _: True)
+    monkeypatch.setattr(afc, "use_cann_zercmoe", lambda _: False)
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
@@ -181,6 +185,7 @@ def test_set_mc2_tokens_capacity_decode_only_without_cudagraph_uses_decode_shape
 
 def test_set_mc2_tokens_capacity_disable_recompute_decode_uses_max_num_batched_tokens(monkeypatch):
     monkeypatch.setattr(afc, "use_cann_megamoe", lambda _: True)
+    monkeypatch.setattr(afc, "use_cann_zercmoe", lambda _: False)
     monkeypatch.setattr(
         afc,
         "get_ascend_config",

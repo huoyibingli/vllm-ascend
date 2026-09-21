@@ -15,6 +15,8 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -62,6 +64,7 @@ def setup_moe_comm_method(moe_config):
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
         _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
         _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+        _MoECommMethods[MoECommType.ZERC_MOE] = ZercMoECommImpl(moe_config)
     else:
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
 
@@ -520,6 +523,325 @@ class FusedMC2CommImpl(MoECommMethod):
                 expert_tokens = self.expert_token_nums
         else:
             raise ValueError(f"Wrong value of {get_ascend_config().enable_fused_mc2=}")
+        return FusedExpertsResult(
+            routed_out=out,
+            expert_tokens=expert_tokens,
+            swiglu_limit=fused_experts_input.swiglu_limit,
+            swiglu_alpha=fused_experts_input.swiglu_alpha,
+            swiglu_beta=fused_experts_input.swiglu_beta,
+        )
+
+
+_ZERCMOE_BASE_PORT = 28761
+
+
+def _default_zercmoe_ipport(ep_world_size: int) -> str:
+    """Auto SHMEM bootstrap address for single-node deployments.
+
+    Two collision sources must be avoided (both relevant when parallel vllm
+    instances pin disjoint NPU sets via ASCEND_RT_VISIBLE_DEVICES):
+      - instance offset: first entry of ASCEND_RT_VISIBLE_DEVICES (0 when
+        unset) - instances pinned to different NPU sets get different ports;
+      - group offset: global_rank // ep_world_size - vLLM places EP groups on
+        contiguous global-rank blocks, identical on all members of one group.
+    """
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    try:
+        instance_base = int(visible.split(",")[0]) if visible else 0
+    except ValueError:
+        instance_base = 0
+    group_idx = torch.distributed.get_rank() // ep_world_size
+    return f"tcp://127.0.0.1:{_ZERCMOE_BASE_PORT + instance_base + group_idx}"
+
+
+def _calc_zercmoe_shmem_mb(m_max: int, num_topk: int, hidden: int) -> int:
+    """SHMEM symmetric heap size (MB/rank), identical on all EP ranks.
+
+    Kernel heap layout: 35MB + 35MB + 430MB fixed regions; the remainder is
+    the combine write-back region needing ~ m * topK * hidden * 2B. A 1.5x
+    margin covers routing skew. Passed explicitly because the wheel's
+    auto-estimate assumes topK ~= 2*EP.
+
+    Args:
+        m_max: per-rank MoE input cap (token_dispatcher.max_num_tokens_per_rank).
+        num_topk: experts per token (topK).
+        hidden: hidden dimension.
+    """
+    d2_mb = math.ceil(m_max * num_topk * hidden * 2 / 2**20)
+    return 512 + math.ceil(d2_mb * 1.5) + 128
+
+
+_ZERCMOE_EARLY_SYM_BUFFER: _ZercMoeSymmBuffer | None = None
+
+
+def early_init_zercmoe(vllm_config) -> None:
+    """Early SHMEM init at worker startup (post-distributed, pre-model-load).
+
+    The ZercMoE SHMEM transport (aclshmemx_init_attr -> hybm_import) fails with
+    ACLSHMEM_INNER_ERROR (-4) when the init runs inside a heavily-loaded worker
+    process (after model weight loading, multi-threaded runtime). torchrun-based
+    reference usage (lightweight process) always succeeds. Moving the init to
+    the worker startup window — after the EP/mc2 group is created but before
+    model loading — mirrors the lightweight process and avoids the issue.
+
+    Stores the symm buffer in ``_ZERCMOE_EARLY_SYM_BUFFER``;
+    ``ZercMoECommImpl._lazy_init_zercmoe`` picks it up later (skipping the
+    lazy path). Falls through silently if the gate is off or the mc2
+    capacity is not yet set.
+    """
+    global _ZERCMOE_EARLY_SYM_BUFFER
+    if _ZERCMOE_EARLY_SYM_BUFFER is not None:
+        return
+
+    from vllm_ascend.ascend_forward_context import (
+        get_mc2_tokens_capacity,
+        use_cann_zercmoe,
+    )
+    from vllm_ascend.distributed.parallel_state import get_mc2_group
+
+    if not use_cann_zercmoe(vllm_config):
+        return
+
+    mc2_group = get_mc2_group()
+    ep_world_size = mc2_group.world_size
+    ep_rank = mc2_group.rank_in_group
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    mc2_cap = get_mc2_tokens_capacity() or 0
+    num_max_tokens = (mc2_cap // tp_size) if mc2_cap else 0
+    if num_max_tokens <= 0:
+        # mc2 capacity not yet set; skip (lazy init will handle later).
+        return
+
+    hf = vllm_config.model_config.hf_text_config
+    moe_expert_num = vllm_config.model_config.get_num_experts()
+    num_topk = int(getattr(hf, "num_experts_per_tok", getattr(hf, "top_k_experts", 1)))
+    hidden = int(hf.hidden_size)
+    intermediate_hidden = int(getattr(hf, "moe_intermediate_size", 0))
+
+    cfg = get_ascend_config()
+    ipport = cfg.zercmoe_ipport or _default_zercmoe_ipport(ep_world_size)
+    mem_mb = cfg.zercmoe_shmem_mb or _calc_zercmoe_shmem_mb(num_max_tokens, num_topk, hidden)
+
+    # Import zercmoe (loads the bundled SHMEM .so's) BEFORE constructing the
+    # symm buffer — _ZercMoeSymmBuffer.__init__ calls torch.ops.npu.dispatch_gmm_init
+    # which is only registered after the import. Doing this here (pre-model-load,
+    # lightweight process) mirrors the torchrun reference usage.
+    zercmoe_mod = comm_utils.load_zercmoe_ops()
+    if zercmoe_mod is None:
+        logger.warning_once("ZercMoE early init skipped: zercmoe wheel failed to import.")
+        return
+
+    logger.info(
+        "ZercMoE early symm-buffer init (pre-model-load): world=%s rank=%s "
+        "num_max_tokens_per_rank=%s ipport=%s heap=%sMB",
+        ep_world_size,
+        ep_rank,
+        num_max_tokens,
+        ipport,
+        mem_mb,
+    )
+    _ZERCMOE_EARLY_SYM_BUFFER = _ZercMoeSymmBuffer(
+        moe_expert_num=moe_expert_num,
+        ep_world_size=ep_world_size,
+        ep_rank=ep_rank,
+        num_max_tokens_per_rank=num_max_tokens,
+        num_topk=num_topk,
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
+        ipport=ipport,
+        device_id=torch.npu.current_device(),
+        mem_size_mb=mem_mb,
+    )
+    logger.info("ZercMoE early init success.")
+
+
+class _ZercMoeSymmBuffer:
+    """Duck-typed stand-in for zercmoe.SymmBuffer (wheel v1.3.1).
+
+    The wheel's SymmBuffer reads the SHMEM pe rank from the RANK/WORLD_SIZE
+    env vars (torchrun-oriented) and asserts WORLD_SIZE == ep_world_size, but
+    vLLM worker processes do not set those env vars - they track the EP (mc2)
+    rank in the process group instead. Call the underlying dispatch_gmm_init
+    directly with the authoritative mc2 rank and expose the attributes that
+    zercmoe.mega_moe reads (moe_expert_num / ep_world_size / ccl_buffer_size,
+    plus the full SymmBuffer public surface for forward-compat). This also
+    removes the env-based world==EP assumption for future PP>1 support.
+    """
+
+    def __init__(
+        self,
+        moe_expert_num: int,
+        ep_world_size: int,
+        ep_rank: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        hidden: int,
+        intermediate_hidden: int,
+        ipport: str,
+        device_id: int,
+        mem_size_mb: int,
+    ):
+        torch.ops.npu.dispatch_gmm_init(ep_rank, ep_world_size, ipport, device_id, mem_size_mb)
+        self.rank = ep_rank
+        self.rank_id = ep_rank
+        self.ep_world_size = ep_world_size
+        self.moe_expert_num = moe_expert_num
+        self.num_experts = moe_expert_num  # mega_moe.SymmBuffer-compatible alias
+        self.num_local_experts = moe_expert_num // ep_world_size
+        self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        self.num_topk = num_topk
+        self.hidden = hidden
+        self.intermediate_hidden = intermediate_hidden
+        self.ccl_buffer_size = mem_size_mb  # mega_moe.SymmBuffer-compatible alias (MB)
+        self.ipport = ipport
+        self.device_id = device_id
+        # bf16 A16W16 (mirrors the wheel's SymmBuffer defaults)
+        self.dispatch_quant_mode = 0
+        self.dispatch_quant_out_dtype = None
+        self.combine_quant_mode = 0
+        self.comm_alg = ""
+        self.topk_weights_type = 0
+
+    def destroy(self):
+        # API parity with zercmoe.SymmBuffer; intentionally never called
+        # (MegaMoe-style lifecycle, see ZercMoECommImpl._lazy_init_zercmoe).
+        torch.ops.npu.dispatch_gmm_finalize()
+
+
+class ZercMoECommImpl(MoECommMethod):
+    """ZercMoE (dispatch_gmm_combine_zero_redundant) fused-op path.
+
+    Mirrors FusedMC2CommImpl's structure but is bf16-only and uses the zercmoe
+    wheel's SHMEM transport (zercmoe.get_symm_buffer / zercmoe.mega_moe, whose
+    signatures are aligned with cann_ops_transformer's mega_moe) instead of the
+    CANN MegaMoe symm buffer. Selection: A2 prefill/profile-run only, priority
+    over FUSED_MC2 (see _select_a2_moe_comm_method). Rollback:
+    VLLM_ASCEND_ENABLE_ZERC_MOE=0 or uninstall the wheel.
+    """
+
+    def __init__(self, moe_config):
+        super().__init__(moe_config)
+        self._zercmoe = comm_utils.load_zercmoe_ops()  # None = import failed
+        self.zercmoe_symm_buffer = None
+
+    def pad_and_split_input_ids(self, input_ids):
+        return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
+
+    def _get_token_dispatcher(self):
+        # is_fused_mc2=True selects the fused-op capacity mode (4096/rank cap,
+        # max_num_batched_tokens-based capacity); the kwarg semantics are
+        # "fused-op family capacity mode" and are shared with FusedMC2CommImpl.
+        return TokenDispatcherWithMC2(is_fused_mc2=True)
+
+    def _get_prepare_finalize(self):
+        # Same padding/TP-slicing/unpad semantics as the FUSED_MC2 path.
+        return PrepareAndFinalizeWithMC2(self.moe_config)
+
+    def _lazy_init_zercmoe(self):
+        """Collective SHMEM init (symm buffer) at the first ZERC_MOE forward.
+
+        If ``early_init_zercmoe`` already created the symm buffer at worker
+        startup (pre-model-load), reuse it. Otherwise perform the lazy init
+        here (fallback for cases where early init was skipped).
+        """
+        global _ZERCMOE_EARLY_SYM_BUFFER
+        if self.zercmoe_symm_buffer is not None:
+            return
+        if _ZERCMOE_EARLY_SYM_BUFFER is not None:
+            self.zercmoe_symm_buffer = _ZERCMOE_EARLY_SYM_BUFFER
+            logger.info("ZercMoE symm buffer reused from early init.")
+            return
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        if self._zercmoe is None:
+            raise RuntimeError(
+                "ZERC_MOE was selected but the zercmoe wheel failed to import. "
+                "Install the wheel or set VLLM_ASCEND_ENABLE_ZERC_MOE=0."
+            )
+        if self.token_dispatcher.global_bs != 0:
+            # Defensive: should_skip_allreduce_across_dp_group already forces
+            # the uniform (global_bs == 0) mode for zercmoe configs.
+            raise RuntimeError(
+                "ZercMoE requires uniform token counts across EP ranks "
+                "(global_bs == 0), but the current config skips the DP "
+                "all-reduce. Disable fused MC2 or adjust the parallel layout."
+            )
+        cfg = get_ascend_config()
+        ipport = cfg.zercmoe_ipport or _default_zercmoe_ipport(self.token_dispatcher.ep_world_size)
+        # Explicit heap size (topK-aware); the wheel's auto formula assumes
+        # topK ~= 2*EP. Passed via mem_size_mb > 0 to skip its estimation.
+        num_max_tokens = self.token_dispatcher.max_num_tokens_per_rank
+        mem_mb = cfg.zercmoe_shmem_mb or _calc_zercmoe_shmem_mb(
+            num_max_tokens, self.moe_config.experts_per_token, self.moe_config.hidden_dim
+        )
+        logger.info(
+            "ZercMoE symm-buffer init (must match across EP ranks): world=%s "
+            "num_max_tokens_per_rank=%s ipport=%s heap=%sMB",
+            self.token_dispatcher.ep_world_size,
+            num_max_tokens,
+            ipport,
+            mem_mb,
+        )
+        # Bypass the wheel's SymmBuffer (which binds the SHMEM pe to the
+        # RANK/WORLD_SIZE env vars that vLLM workers do not set) and call
+        # dispatch_gmm_init directly with the authoritative mc2 rank. The
+        # duck-typed shim exposes the attributes zercmoe.mega_moe reads.
+        self.zercmoe_symm_buffer = _ZercMoeSymmBuffer(
+            moe_expert_num=self.moe_config.num_experts,
+            ep_world_size=self.token_dispatcher.ep_world_size,
+            ep_rank=self.token_dispatcher.ep_rank_id,
+            num_max_tokens_per_rank=num_max_tokens,
+            num_topk=self.moe_config.experts_per_token,
+            hidden=self.moe_config.hidden_dim,
+            intermediate_hidden=self.moe_config.intermediate_size_per_partition,
+            ipport=ipport,
+            device_id=torch.npu.current_device(),
+            mem_size_mb=mem_mb,
+        )
+        # Lifecycle (MegaMoe-style): sym_buffer.destroy() is NEVER called -
+        # aclrtResetDevice never executes, SHMEM resources are reclaimed at
+        # process exit, and the ranks avoid destroy's exit barrier (an
+        # abnormally killed worker cannot hang the survivors at exit).
+        # All ranks must behave the same (all-or-nothing).
+
+    def _apply_zercmoe(self, fused_experts_input: MoEFusedExpertsInput, topk_ids: torch.Tensor):
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        self._lazy_init_zercmoe()
+        x = fused_experts_input.hidden_states
+        assert x.dtype == torch.bfloat16, f"ZercMoE is bf16-only, got {x.dtype}"
+        num_tokens = x.shape[0]
+        num_max_tokens = self.token_dispatcher.max_num_tokens_per_rank
+        if num_tokens > num_max_tokens:
+            raise ValueError(
+                f"ZercMoE received {num_tokens} tokens per rank, but the shared "
+                f"fused-op capacity is {num_max_tokens}. Increase "
+                "max_num_batched_tokens or disable fused MC2."
+            )
+        # zercmoe.mega_moe: signature aligned with cann_ops_transformer's
+        # mega_moe; auto_pack passes pre-packed 1D weights through (fast path).
+        # ZR-unsupported kwargs are None-only validated inside the package.
+        y, expert_tokens = self._zercmoe.mega_moe(
+            x,
+            topk_ids.to(torch.int32),
+            fused_experts_input.topk_weights.to(torch.float32),
+            fused_experts_input.weights.w1,
+            fused_experts_input.weights.w2,
+            self.zercmoe_symm_buffer,
+        )
+        return y, expert_tokens
+
+    def fused_experts(self, fused_experts_input: MoEFusedExpertsInput):
+        # SiTU stays on the generic MoE path (parity with FusedMC2CommImpl).
+        if isinstance(fused_experts_input.activation, SituActivationConfig):
+            return super().fused_experts(fused_experts_input)
+
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2), (
+            "token_dispatcher must be an instance of TokenDispatcherWithMC2."
+        )
+        topk_ids = fused_experts_input.topk_ids
+        if fused_experts_input.routing.log2phy is not None:
+            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
+
+        out, expert_tokens = self._apply_zercmoe(fused_experts_input, topk_ids)
         return FusedExpertsResult(
             routed_out=out,
             expert_tokens=expert_tokens,
