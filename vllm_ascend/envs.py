@@ -98,11 +98,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # dispatch_gmm_combine_zero_redundant, bf16-only, A2, PP=1, EP in (1, 64],
     # non-LoRA, non-dynamic-EPLB). Effective only when
     # VLLM_ASCEND_ENABLE_FUSED_MC2=1 and the `zercmoe` package is importable
-    # (pip install zercmoe-*.whl). 1 (default): ZERC_MOE takes priority over
-    # mega_moe on A2 prefill. 0: force the legacy mega_moe/FUSED_MC2 path.
+    # (pip install zercmoe-*.whl). 0 (default): force the legacy
+    # mega_moe/FUSED_MC2 path. 1: ZERC_MOE takes priority over mega_moe on
+    # A2 prefill.
     # When ZERC_MOE is active, cudagraph mode is force-disabled because the
     # zerc_moe op host-syncs and lazy-inits the SHMEM transport per call.
-    "VLLM_ASCEND_ENABLE_ZERC_MOE": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_ZERC_MOE", "1")),
+    "VLLM_ASCEND_ENABLE_ZERC_MOE": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_ZERC_MOE", "0")),
     # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
     # Use --additional-config '{"enable_balance_scheduling": true}' instead.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
