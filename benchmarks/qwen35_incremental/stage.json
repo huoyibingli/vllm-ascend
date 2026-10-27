@@ -1,10 +1,12 @@
 {
-  "stage": 0,
-  "branch": "test/00-baseline",
-  "previous_branch": null,
+  "stage": 1,
+  "branch": "test/01-nz",
+  "previous_branch": "test/00-baseline",
   "base": "v0.30.0rc2",
-  "added_feature": "baseline",
-  "features": [],
+  "added_feature": "nz",
+  "features": [
+    "nz"
+  ],
   "hardware": "Ascend A2",
   "tensor_parallel_size": 2,
   "enable_expert_parallel": true,
@@ -14,7 +16,7 @@
   "max_num_batched_tokens": 16384,
   "max_num_seqs": 64,
   "additional_config": {
-    "weight_nz_mode": 1,
+    "weight_nz_mode": 2,
     "enable_flashcomm1": false,
     "multistream_overlap_shared_expert": false,
     "enable_fused_mc2": 0
