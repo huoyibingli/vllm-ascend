@@ -15,10 +15,10 @@ With head sharding, the local head count must still be eight. Encoder ACL
 graph capture retains the original graph buffer and update machinery.
 
 Enable `VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS=1` before worker startup for
-periodic fusion/fallback counters. `VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_CORE_MODE`,
-`VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_BLOCK_T`,
-`VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STORE_MODE`, and
-`VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_OUT_MODE` are launch tuning options; defaults
+periodic fusion/fallback counters (enabled by default; set to `0` to suppress logging). `VLLM_ASCEND_VIT_ROPE_PAD_CORE_MODE`,
+`VLLM_ASCEND_VIT_ROPE_PAD_BLOCK_T`,
+`VLLM_ASCEND_VIT_ROPE_PAD_STORE_MODE`, and
+`VLLM_ASCEND_VIT_ROPE_PAD_ALLOC_MODE` are launch tuning options; defaults
 are defined in `vllm_ascend/envs.py`. There is no master fusion enable flag.
 
 The #16336 snapshot also includes zero-copy FIA read aliases for compatible
