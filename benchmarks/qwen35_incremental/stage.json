@@ -1,11 +1,12 @@
 {
-  "stage": 1,
-  "branch": "test/01-nz",
-  "previous_branch": "test/00-baseline",
+  "stage": 2,
+  "branch": "test/02-conv-layout",
+  "previous_branch": "test/01-nz",
   "base": "v0.30.0rc2",
-  "added_feature": "nz",
+  "added_feature": "conv_layout",
   "features": [
-    "nz"
+    "nz",
+    "conv_layout"
   ],
   "hardware": "Ascend A2",
   "tensor_parallel_size": 2,
