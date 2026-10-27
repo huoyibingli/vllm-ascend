@@ -30,7 +30,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
-from vllm_ascend.ops.weight_prefetch_config import Qwen35WeightPrefetchConfig
+from vllm_ascend.weight_prefetch_config import Qwen35WeightPrefetchConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
