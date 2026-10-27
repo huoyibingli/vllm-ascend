@@ -1,16 +1,17 @@
 {
-  "stage": 6,
-  "branch": "test/06-shared-overlap",
-  "previous_branch": "test/05-gdn-fla",
+  "stage": 7,
+  "branch": "test/07-megamoe",
+  "previous_branch": "test/06-shared-overlap",
   "base": "v0.30.0rc2",
-  "added_feature": "shared_overlap",
+  "added_feature": "megamoe",
   "features": [
     "nz",
     "conv_layout",
     "fusion",
     "image_preprocess",
     "gdn_fla",
-    "shared_overlap"
+    "shared_overlap",
+    "megamoe"
   ],
   "hardware": "Ascend A2",
   "tensor_parallel_size": 2,
@@ -24,10 +25,12 @@
     "weight_nz_mode": 2,
     "enable_flashcomm1": false,
     "multistream_overlap_shared_expert": true,
-    "enable_fused_mc2": 0,
+    "enable_fused_mc2": 2,
     "enable_qwen3_preprocess_on_npu": true,
     "enable_fla_gdn": true,
-    "fla_chunk_size": 128
+    "fla_chunk_size": 128,
+    "allow_megamoe_shared_expert_overlap": true,
+    "mega_moe_prefill_token_threshold": 64
   },
   "environment": {
     "VLLM_USE_V2_MODEL_RUNNER": "0",

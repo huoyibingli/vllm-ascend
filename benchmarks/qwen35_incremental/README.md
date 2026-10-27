@@ -46,3 +46,12 @@ and paired-repeat gain over baseline. Positive means improvement: throughput
 uses `(current/reference - 1) * 100`; latency uses `(1 - current/reference) * 100`.
 Regressions remain negative. Cumulative gains must not be added arithmetically.
 No NPU performance measurements are supplied with these branches.
+
+Stage 07 opts into `allow_megamoe_shared_expert_overlap=true` while retaining
+`multistream_overlap_shared_expert=true`. This exception is restricted to A2
+MegaMoe, EP and DP1/PP1 without quantization/LoRA/speculation. Pure prefill may
+select MegaMoe, whose shared work uses the existing no-internal-event fallback;
+pure decode ALLGATHER uses the four-phase schedule. Fused backend execution
+never waits for nonexistent GMM-stage events. Original mutex behavior remains
+unchanged when the opt-in flag is absent. Validate both paths and graph replay
+on NPU before accepting performance numbers.
