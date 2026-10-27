@@ -15,11 +15,12 @@ from vllm_ascend.ops.weight_prefetch_config import NUM_HIDDEN_LAYERS
 
 # 0 is NCHW, layout-equivalent to ND for 2-D weights; 2 is ND.
 ND_FORMATS = (0, 2)
+NZ_FORMAT = 29
 GDN_OUT_PROJ_SHAPE = (2048, 2048)
 GDN_IN_PROJ_QKVZ_SHAPE = (6144, 2048)
 FULL_ATTN_QKV_PROJ_SHAPE = (4608, 2048)
 ROUTED_W2_SHAPE = (256, 256, 2048)
-GDN_LAYER_KEY_RE = re.compile(r"^(?:language_model\.)?model\.layers\.(\d+)\.linear_attn$")
+GDN_LAYER_KEY_RE = re.compile(r"^(?:model\.)?(?:language_model\.)?model\.layers\.(\d+)\.linear_attn$")
 
 
 def gdn_layer_index(layer_name):
@@ -37,7 +38,7 @@ def current_controller():
     return getattr(getattr(context, "model_instance", None), "_qwen35_weight_prefetch", None)
 
 
-def supported_weight(weight, shape):
+def supported_weight(weight, shape, *, allow_nz=False):
     return (
         isinstance(weight, torch.Tensor)
         and weight.device.type == "npu"
@@ -45,7 +46,7 @@ def supported_weight(weight, shape):
         and tuple(weight.shape) == shape
         and weight.is_contiguous()
         and weight.storage_offset() == 0
-        and torch_npu.get_npu_format(weight) in ND_FORMATS
+        and torch_npu.get_npu_format(weight) in (ND_FORMATS + (NZ_FORMAT,) if allow_nz else ND_FORMATS)
     )
 
 
@@ -191,12 +192,14 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
         or parallel.tensor_parallel_size != 2
         or parallel.data_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
-        or parallel.enable_expert_parallel
+        or (parallel.enable_expert_parallel and not config.allow_ep_nz_dense)
         or getattr(parallel, "use_sequence_parallel_moe", False)
         or vllm_config.quant_config is not None
         or vllm_config.lora_config is not None
         or vllm_config.speculative_config is not None
     ):
+        if config.allow_ep_nz_dense:
+            raise ValueError("EP/NZ dense prefetch requires A2 Qwen3.5-35B BF16 TP2 DP1/PP1 without SP/quant/LoRA/spec")
         logger.warning("Qwen3.5 prefetch unsupported device/model/parallel/quantization; using ordinary path")
         return
     from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
@@ -220,7 +223,7 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
             if gdn_layer_index(layer_name) == index:
                 projection = attention.out_proj
                 weight = projection.weight
-                if supported_weight(weight, GDN_OUT_PROJ_SHAPE):
+                if supported_weight(weight, GDN_OUT_PROJ_SHAPE, allow_nz=config.allow_ep_nz_dense):
                     if config.gdn_out_bytes > weight.numel() * weight.element_size():
                         raise ValueError(f"gdn_out_bytes exceeds weight storage at layer {index}")
                     controller.gdn_out_weights[layer_name] = (
@@ -240,7 +243,7 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
                         config.gdn_out_bytes,
                     )
                 else:
-                    logger.warning("Layer %d GDN out_proj is not supported BF16 ND TP2 storage", index)
+                    logger.warning("Layer %d GDN out_proj does not match supported BF16 TP2 storage", index)
             else:
                 logger.warning("Layer %d GDN prefix %r is not a main-model layer name", index, layer_name)
 
@@ -252,7 +255,7 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
             return
         owner = owners[0]
         if "routed_w2" in config.targets:
-            weight = owner.routed_experts.w2_weight
+            weight = getattr(owner.routed_experts, "w2_weight", None)
             if supported_weight(weight, ROUTED_W2_SHAPE):
                 if config.routed_w2_bytes > weight.numel() * weight.element_size():
                     raise ValueError("routed_w2_bytes exceeds bound weight storage")
@@ -272,12 +275,12 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
         if target.layer_type not in config.next_layer_types:
             continue
         if target.layer_type == "linear_attention":
-            projection, shape = target.linear_attn.in_proj_qkvz, GDN_IN_PROJ_QKVZ_SHAPE
+            projection, shape = getattr(target.linear_attn, "in_proj_qkvz", None), GDN_IN_PROJ_QKVZ_SHAPE
         else:
             projection, shape = target.self_attn.qkv_proj, FULL_ATTN_QKV_PROJ_SHAPE
-        weight = projection.weight
-        if not supported_weight(weight, shape):
-            logger.warning("Layer %d next input is not supported BF16 ND TP2 storage", index)
+        weight = getattr(projection, "weight", None)
+        if not supported_weight(weight, shape, allow_nz=config.allow_ep_nz_dense):
+            logger.warning("Layer %d next input does not match supported BF16 TP2 storage", index)
             continue
         size = config.next_input_bytes
         if size == "full":
@@ -319,6 +322,12 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
             controller.next_gdn_out[owner.layer_name] = target_name
             owner._qwen35_prefetch_layer_name = owner.layer_name
             logger.info("Qwen3.5 GDN out_proj prefetch submit source=%d target=%d", index - 1, index)
+    if config.allow_ep_nz_dense:
+        counts = {"next_input": len(controller.next_inputs), "gdn_out": len(controller.gdn_out_weights)}
+        missing = [target for target in config.targets if not counts.get(target, 0)]
+        if missing:
+            _unbind(model, f"no bound storage for requested targets {missing}")
+            raise RuntimeError(f"Qwen3.5 cumulative prefetch has no bound storage for {missing}")
     logger.info(
         "Qwen3.5 prefetch bound: next_inputs=%d routed_w2=%d gdn_out=%d mode=%s join=%s budgets=%s/%s/%s",
         len(controller.next_inputs),

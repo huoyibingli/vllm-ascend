@@ -33,6 +33,8 @@ NUM_HIDDEN_LAYERS = 40
 @dataclass(frozen=True)
 class Qwen35WeightPrefetchConfig:
     enabled: bool = False
+    # Opt-in composition for dense weights in TP2 EP2/NZ benchmark stages.
+    allow_ep_nz_dense: bool = False
     mode: str = "full"
     targets: tuple[str, ...] = ("next_input",)
     next_input_bytes: int | str = 2 * 1024 * 1024
@@ -67,6 +69,10 @@ class Qwen35WeightPrefetchConfig:
             result = cls(**options)
         except TypeError as error:
             raise ValueError(f"invalid qwen35_weight_prefetch value: {error}") from error
+        if type(result.allow_ep_nz_dense) is not bool:
+            raise ValueError("allow_ep_nz_dense must be boolean")
+        if result.allow_ep_nz_dense and "routed_w2" in result.targets:
+            raise ValueError("allow_ep_nz_dense supports only next_input and gdn_out targets")
         if type(result.enabled) is not bool or result.mode not in ("full", "control"):
             raise ValueError("enabled must be boolean; mode must be full or control")
         if not result.targets or set(result.targets) - {"next_input", "routed_w2", "gdn_out"}:
