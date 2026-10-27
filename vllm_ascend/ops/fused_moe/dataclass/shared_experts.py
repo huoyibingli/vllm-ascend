@@ -49,6 +49,9 @@ class RoutedMoEMilestones:
     router_output_ready: torch.npu.Event | None = None
     routed_dispatch_start: torch.npu.Event | None = None
     shared_activation_overlap_start: torch.npu.Event | None = None
+    routed_mlp_start: torch.npu.Event | None = None
+    routed_activation_start: torch.npu.Event | None = None
+    routed_gmm2_start: torch.npu.Event | None = None
     routed_combine_start: torch.npu.Event | None = None
     routed_finalize_done: torch.npu.Event | None = None
 

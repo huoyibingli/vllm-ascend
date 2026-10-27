@@ -82,6 +82,8 @@ class FusedExpertsResult:
     # communication method that supports shared experts in parallel with routed
     # experts.
     before_dispatch_evt: torch.npu.Event | None = None
+    before_moe_up_evt: torch.npu.Event | None = None
+    before_swiglu_evt: torch.npu.Event | None = None
     before_gmm2_evt: torch.npu.Event | None = None
     before_combine_evt: torch.npu.Event | None = None
     shared_activation_overlap_start_evt: torch.npu.Event | None = None
@@ -158,6 +160,8 @@ class MoECommMethod(ABC):
         )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
+        stage_events = {} if get_ascend_config().multistream_overlap_shared_expert else None
+        before_moe_up_evt = torch.npu.current_stream().record_event() if stage_events is not None else None
         shared_activation_overlap_start_evt = None
         if self.shared_activation_overlaps_routed_gmm1:
             shared_activation_overlap_start_evt = torch.npu.current_stream().record_event()
@@ -172,7 +176,10 @@ class MoECommMethod(ABC):
             # its own MLP implementation.
             mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
         else:
-            mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method)
+            if stage_events is None:
+                mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method)
+            else:
+                mlp_output, before_gmm2_evt = apply_moe_mlp(mlp_compute_input, quant_method, stage_events=stage_events)
 
         if shared_activation_overlap_start_evt is None:
             shared_activation_overlap_start_evt = before_gmm2_evt
@@ -186,6 +193,8 @@ class MoECommMethod(ABC):
         return FusedExpertsResult(
             routed_out=routed_out,
             before_dispatch_evt=before_dispatch_evt,
+            before_moe_up_evt=before_moe_up_evt,
+            before_swiglu_evt=stage_events.get("before_swiglu") if stage_events is not None else None,
             before_gmm2_evt=before_gmm2_evt,
             before_combine_evt=before_combine_evt,
             shared_activation_overlap_start_evt=shared_activation_overlap_start_evt,
