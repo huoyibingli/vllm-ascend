@@ -1,0 +1,26 @@
+{
+  "stage": 0,
+  "branch": "test/00-baseline",
+  "previous_branch": null,
+  "base": "v0.30.0rc2",
+  "added_feature": "baseline",
+  "features": [],
+  "hardware": "Ascend A2",
+  "tensor_parallel_size": 2,
+  "enable_expert_parallel": true,
+  "dtype": "bfloat16",
+  "seed": 42,
+  "max_model_len": 16384,
+  "max_num_batched_tokens": 16384,
+  "max_num_seqs": 64,
+  "additional_config": {
+    "weight_nz_mode": 1,
+    "enable_flashcomm1": false,
+    "multistream_overlap_shared_expert": false,
+    "enable_fused_mc2": 0
+  },
+  "environment": {
+    "VLLM_USE_V2_MODEL_RUNNER": "0",
+    "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
+  }
+}
