@@ -86,15 +86,26 @@ def get_mrv2_in_profile_run() -> bool:
 
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
     # TODO: drop the EP-size guard when MegaMoe supports larger EP sizes.
-    return (
-        is_mega_moe_supported()
-        and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE)
-        and get_ascend_config().enable_fused_mc2 == 1
+    mega_moe_available = is_mega_moe_supported()
+    can_megamoe = get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE)
+    fused_mc2_enabled = get_ascend_config().enable_fused_mc2 == 1
+    supported = (
+        mega_moe_available
+        and can_megamoe
+        and fused_mc2_enabled
         and is_moe_model(vllm_config)
         and vllm_config.parallel_config.enable_expert_parallel
         and 1 < get_ep_group().world_size <= 64
         and getattr(vllm_config, "lora_config", None) is None
     )
+    logger.info_once(
+        "use_cann_megamoe=%s (mega_moe_available=%s, hw_supports_megamoe=%s, enable_fused_mc2=%s)",
+        supported,
+        mega_moe_available,
+        can_megamoe,
+        fused_mc2_enabled,
+    )
+    return supported
 
 
 @contextmanager
@@ -154,6 +165,8 @@ def set_ascend_forward_context(
             vllm_config,
             is_draft_model=is_draft_model,
             draft_moe_quant_type=draft_moe_quant_type,
+            attn_metadata=attn_metadata,
+            in_profile_run=in_profile_run,
         )
 
         forward_context.moe_comm_type = moe_comm_type
@@ -300,12 +313,41 @@ def _select_capacity_and_expert_density_moe_comm_method(
     mc2_tokens_capacity: int,
     is_draft_model: bool = False,
     draft_moe_quant_type: QuantType = QuantType.NONE,
+    attn_metadata: Any = None,
+    in_profile_run: bool = False,
 ) -> MoECommType:
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = (
         vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
     )
     num_experts_per_device = num_experts // ep_world_size
+
+    metadata = attn_metadata.values() if isinstance(attn_metadata, dict) else (attn_metadata,)
+    phases = [(getattr(meta, "num_prefills", 0), getattr(meta, "num_decode_tokens", None)) for meta in metadata]
+    is_pure_prefill = bool(phases) and all(prefills > 0 and decodes == 0 for prefills, decodes in phases)
+    ascend_config = get_ascend_config()
+    # Local phase counts cannot select a collective shared across DP ranks:
+    # another rank may be decoding. Keep the new phase-aware route on DP=1.
+    if (
+        use_cann_megamoe(vllm_config)
+        and getattr(vllm_config.parallel_config, "data_parallel_size", 1) == 1
+        and not is_draft_model
+        and getattr(vllm_config, "speculative_config", None) is None
+        and (is_pure_prefill or in_profile_run)
+        and (in_profile_run or (num_tokens is not None and num_tokens > ascend_config.mega_moe_prefill_token_threshold))
+    ):
+        logger.info_once(
+            "A2 MegaMoe fused prefill selected (num_tokens=%s, num_prefills=%s, "
+            "num_decode_tokens=%s, in_profile_run=%s)",
+            num_tokens,
+            phases[0][0] if phases else 0,
+            phases[0][1] if phases else 0,
+            in_profile_run,
+        )
+        return MoECommType.FUSED_MC2
+
+    if num_experts > 512:
+        return MoECommType.ALLGATHER
     if (
         num_experts_per_device <= 24
         and ep_world_size >= 16
@@ -321,6 +363,8 @@ def _select_fused_or_capacity_moe_comm_method(
     mc2_tokens_capacity: int,
     is_draft_model: bool = False,
     draft_moe_quant_type: QuantType = QuantType.NONE,
+    attn_metadata: Any = None,
+    in_profile_run: bool = False,
 ) -> MoECommType:
     if use_cann_megamoe(vllm_config):
         return MoECommType.FUSED_MC2
@@ -339,6 +383,8 @@ def _select_capacity_and_world_size_moe_comm_method(
     mc2_tokens_capacity: int,
     is_draft_model: bool = False,
     draft_moe_quant_type: QuantType = QuantType.NONE,
+    attn_metadata: Any = None,
+    in_profile_run: bool = False,
 ) -> MoECommType:
     if get_ascend_config().enable_fused_mc2 == 1:
         if is_mega_moe_supported():
@@ -375,6 +421,8 @@ def select_moe_comm_method(
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
     draft_moe_quant_type: QuantType = QuantType.NONE,
+    attn_metadata: Any = None,
+    in_profile_run: bool = False,
 ) -> MoECommType | None:
     """Select the MoE communication method from the active hardware policy,
     parallel settings, and token count.
@@ -411,6 +459,8 @@ def select_moe_comm_method(
             mc2_tokens_capacity,
             is_draft_model,
             draft_moe_quant_type,
+            attn_metadata,
+            in_profile_run,
         )
     logger.debug(
         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "
