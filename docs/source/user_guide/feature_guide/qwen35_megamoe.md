@@ -6,14 +6,14 @@ before starting workers, then use TP4, EP enabled, DP1:
 
 ```bash
 vllm serve <Qwen3.5-35B-A3B-model> -tp 4 --enable-expert-parallel \
-  --additional-config '{"enable_fused_mc2":2,"mega_moe_max_tokens":512,"mega_moe_prefill_token_threshold":64}'
+  --additional-config '{"enable_fused_mc2":2,"mega_moe_prefill_token_threshold":64}'
 ```
 
 `enable_fused_mc2=2` retains MegaMoe; `1` explicitly rolls back to
 `dispatch_ffn_combine`. The internal normalized value is `1` in both cases,
 so check `use_cann_megamoe=True` and the selected `FUSED_MC2` route in logs.
 `mega_moe_max_tokens` is the received-token capacity per rank, not a batch
-selection threshold. Size it for the actual routing workload to avoid token
+selection threshold (default 65536). The example retains that default; size it for the actual routing workload to avoid token
 truncation. `mega_moe_prefill_token_threshold` is a non-negative token count
 (default 64); batches must be strictly larger to use the new route.
 
