@@ -4377,6 +4377,11 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    def reload_weights(self, *args, **kwargs) -> None:
+        if self.ascend_config.qwen35_weight_prefetch.enabled:
+            raise RuntimeError("Restart with Qwen3.5 weight prefetch disabled before reloading captured weights")
+        return super().reload_weights(*args, **kwargs)
+
     def load_model(self) -> None:
         from vllm_ascend.model_executor.warmup.early_kernel_warmup import (
             join_early_kernel_warmup,
@@ -4484,6 +4489,11 @@ class NPUModelRunner(GPUModelRunner):
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         get_offloader().post_init()
+        if self.ascend_config.qwen35_weight_prefetch.enabled:
+            from vllm_ascend.ops.weight_prefetch_qwen35 import bind_qwen35_weight_prefetch
+
+            bind_qwen35_weight_prefetch(self.model, self.vllm_config, self.ascend_config.qwen35_weight_prefetch)
+
         if self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_fused_copy_sfa:
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 

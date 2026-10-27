@@ -45,13 +45,34 @@ def apply_moe_mlp(
                 quant_method=quant_method,
             )
 
+    from vllm_ascend.ops.weight_prefetch_qwen35 import current_controller
+
+    prefetch = (
+        current_controller()
+        if not mlp_compute_input.quant.is_quant and mlp_compute_input.lora_context is None
+        else None
+    )
+    w2 = mlp_compute_input.weights.w2
+    prefetch_started = prefetch is not None and prefetch.begin_routed(
+        w2,
+        mlp_compute_input.group_list,
+        mlp_compute_input.hidden_states,
+        "after_dispatch",
+        mlp_compute_input.group_list_type,
+    )
     if quant_method.supports_fused_activation(mlp_compute_input.activation):
         hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
     else:
         hidden_states = quant_method.apply_gmm1(mlp_compute_input)
+        if prefetch is not None and not prefetch_started:
+            prefetch_started = prefetch.begin_routed(
+                w2, mlp_compute_input.group_list, hidden_states, "after_gmm1", mlp_compute_input.group_list_type
+            )
         hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
         hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
 
+    if prefetch_started:
+        prefetch.join()
     before_gmm2_evt = torch.npu.current_stream().record_event()
     hidden_states = quant_method.apply_gmm2(mlp_compute_input, hidden_states, act_out_scale)
     return hidden_states, before_gmm2_evt
