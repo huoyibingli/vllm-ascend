@@ -571,8 +571,9 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -597,6 +598,7 @@ class AscendConfig:
     # count exceeds it, tokens may be truncated, causing precision
     # degradation. Do not set it too large because workspace memory scales
     # linearly with this value. Default 65536.
+    mega_moe_prefill_token_threshold: int = 64
     mega_moe_max_tokens: int = 65536
     ascend_log_path: str = dataclasses.field(
         default_factory=lambda: os.path.join(os.path.expanduser("~"), "ascend", "log", "vllm_ascend")
@@ -658,6 +660,8 @@ class AscendConfig:
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.mega_moe_prefill_token_threshold < 0:
+            raise ValueError("mega_moe_prefill_token_threshold must be non-negative")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
@@ -1069,7 +1073,7 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
-        if moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
+        if moe_intermediate_size < 512 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
             return False
 
         quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
