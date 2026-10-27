@@ -37,6 +37,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -52,6 +53,11 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
+
+
+def _is_fla_gdn_enabled() -> bool:
+    """Use the validated configuration of the current engine."""
+    return get_ascend_config().enable_fla_gdn
 
 
 @lru_cache(maxsize=1)
@@ -205,7 +211,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     @classmethod
     def _supports_host_metadata_prefill(cls) -> bool:
         """Whether an available fused prefill path only needs host metadata."""
-        use_fla_gdn_prefill = get_current_hardware_profile().supports(HardwareCapability.FLA_GDN_PREFILL)
+        use_fla_gdn_prefill = _is_fla_gdn_enabled() and get_current_hardware_profile().supports(
+            HardwareCapability.FLA_GDN_PREFILL
+        )
         if use_fla_gdn_prefill and _get_fla_gdn_prefill_op() is not None:
             return True
         return cls._probe_fused_chunk()
@@ -617,8 +625,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
-            use_fla_gdn_prefill = get_pcp_group().world_size == 1 and get_current_hardware_profile().supports(
-                HardwareCapability.FLA_GDN_PREFILL
+            use_fla_gdn_prefill = (
+                _is_fla_gdn_enabled()
+                and get_pcp_group().world_size == 1
+                and get_current_hardware_profile().supports(HardwareCapability.FLA_GDN_PREFILL)
             )
             fla_gdn_prefill_op = _get_fla_gdn_prefill_op() if use_fla_gdn_prefill else None
             # The built-in fused operator is NPU-only. Keep CPU/unit-test
