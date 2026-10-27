@@ -23,12 +23,13 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_reduce_scatter
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.activation import SituAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodBase
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.lora.fused_moe import has_lora
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
@@ -88,6 +89,7 @@ class SubmittedSharedExpertGateUp:
     gate_up_input_scale: torch.Tensor | None
     local_dp_metadata: tuple[int, int] | None
     path: SharedExpertMLPPath
+    expert_gate: torch.Tensor | None = None
 
 
 class AscendSharedExperts:
@@ -452,6 +454,21 @@ class AscendSharedExperts:
         prepared_input = prepare_input(layer, hidden_states)
         return hidden_states if prepared_input is None else prepared_input
 
+    def _uses_four_phase_overlap(self) -> bool:
+        if (
+            not self.multistream_overlap
+            or self.quant_type != QuantType.NONE
+            or has_lora(self.lora_context)
+            or _EXTRA_CTX.moe_comm_type != MoECommType.ALLGATHER
+        ):
+            return False
+        metadata = get_forward_context().attn_metadata
+        entries = metadata.values() if isinstance(metadata, dict) else (metadata,)
+        entries = tuple(entries)
+        return bool(entries) and all(
+            getattr(meta, "num_prefills", None) == 0 and getattr(meta, "num_decodes", 0) > 0 for meta in entries
+        )
+
     def enqueue_gate_up_after_router(
         self,
         prepared_execution: PreparedSharedExpertExecution,
@@ -466,6 +483,7 @@ class AscendSharedExperts:
         """
         path = self._select_mlp_path()
         gate_up_input_scale = None
+        expert_gate = None
         with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap):
             self._wait_for_milestone(router_output_ready, "router_output_ready")
             if path is SharedExpertMLPPath.A8_INT_FUSED:
@@ -488,6 +506,8 @@ class AscendSharedExperts:
                 gate_up = self.layer.gate_up_proj((quantized_x, pertoken_scale))[0]
             else:
                 gate_up = self.part1(prepared_execution.gate_up_input)
+                if self._uses_four_phase_overlap() and getattr(self.layer, "expert_gate", None) is not None:
+                    expert_gate = self.layer.expert_gate(prepared_execution.hidden_states)[0]
 
         return SubmittedSharedExpertGateUp(
             hidden_states=prepared_execution.hidden_states,
@@ -495,6 +515,7 @@ class AscendSharedExperts:
             gate_up_input_scale=gate_up_input_scale,
             local_dp_metadata=prepared_execution.local_dp_metadata,
             path=path,
+            expert_gate=expert_gate,
         )
 
     def _run_a8_int_mlp(
@@ -609,6 +630,19 @@ class AscendSharedExperts:
         submitted_gate_up: SubmittedSharedExpertGateUp,
         milestones: RoutedMoEMilestones,
     ) -> torch.Tensor:
+        if self._uses_four_phase_overlap() and all(
+            event is not None
+            for event in (milestones.routed_mlp_start, milestones.routed_activation_start, milestones.routed_gmm2_start)
+        ):
+            self._wait_for_milestone(milestones.routed_mlp_start, "routed_mlp_start")
+            shared_act = self.apply_activation(submitted_gate_up.gate_up)
+            gate = submitted_gate_up.expert_gate
+            gate = torch.sigmoid(gate) if gate is not None else None
+            down_input = self._prepare_linear_input_for_overlap(self.layer.down_proj, shared_act)
+            self._wait_for_milestone(milestones.routed_activation_start, "routed_activation_start")
+            shared_out = self.layer.down_proj(down_input)[0]
+            self._wait_for_milestone(milestones.routed_gmm2_start, "routed_gmm2_start")
+            return shared_out if gate is None else shared_out * gate
         self._wait_for_routed_stage(
             milestones,
             milestones.shared_activation_overlap_start,

@@ -1,15 +1,16 @@
 {
-  "stage": 5,
-  "branch": "test/05-gdn-fla",
-  "previous_branch": "test/04-image-preprocess",
+  "stage": 6,
+  "branch": "test/06-shared-overlap",
+  "previous_branch": "test/05-gdn-fla",
   "base": "v0.30.0rc2",
-  "added_feature": "gdn_fla",
+  "added_feature": "shared_overlap",
   "features": [
     "nz",
     "conv_layout",
     "fusion",
     "image_preprocess",
-    "gdn_fla"
+    "gdn_fla",
+    "shared_overlap"
   ],
   "hardware": "Ascend A2",
   "tensor_parallel_size": 2,
@@ -22,7 +23,7 @@
   "additional_config": {
     "weight_nz_mode": 2,
     "enable_flashcomm1": false,
-    "multistream_overlap_shared_expert": false,
+    "multistream_overlap_shared_expert": true,
     "enable_fused_mc2": 0,
     "enable_qwen3_preprocess_on_npu": true,
     "enable_fla_gdn": true,
