@@ -1,9 +1,9 @@
 {
-  "stage": 7,
-  "branch": "test/07-megamoe",
-  "previous_branch": "test/06-shared-overlap",
+  "stage": 8,
+  "branch": "test/08-weight-prefetch",
+  "previous_branch": "test/07-megamoe",
   "base": "v0.30.0rc2",
-  "added_feature": "megamoe",
+  "added_feature": "weight_prefetch",
   "features": [
     "nz",
     "conv_layout",
@@ -11,7 +11,8 @@
     "image_preprocess",
     "gdn_fla",
     "shared_overlap",
-    "megamoe"
+    "megamoe",
+    "weight_prefetch"
   ],
   "hardware": "Ascend A2",
   "tensor_parallel_size": 2,
@@ -30,7 +31,19 @@
     "enable_fla_gdn": true,
     "fla_chunk_size": 128,
     "allow_megamoe_shared_expert_overlap": true,
-    "mega_moe_prefill_token_threshold": 64
+    "mega_moe_prefill_token_threshold": 64,
+    "qwen35_weight_prefetch": {
+      "enabled": true,
+      "allow_ep_nz_dense": true,
+      "targets": [
+        "next_input",
+        "gdn_out"
+      ],
+      "mode": "full",
+      "next_input_bytes": 2097152,
+      "gdn_out_bytes": 2097152,
+      "min_decode_concurrency": 8
+    }
   },
   "environment": {
     "VLLM_USE_V2_MODEL_RUNNER": "0",

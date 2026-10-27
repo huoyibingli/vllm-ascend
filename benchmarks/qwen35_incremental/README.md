@@ -55,3 +55,15 @@ pure decode ALLGATHER uses the four-phase schedule. Fused backend execution
 never waits for nonexistent GMM-stage events. Original mutex behavior remains
 unchanged when the opt-in flag is absent. Validate both paths and graph replay
 on NPU before accepting performance numbers.
+
+Stage 08 retains NZ and EP. Its prefetch config explicitly opts into
+`allow_ep_nz_dense` for `next_input` and `gdn_out`: the torch_npu prefetch API
+accepts weight data independently of layout. It passes the loaded NZ tensor
+directly, uses bounded byte prefixes, and never converts it to ND or replaces
+its storage. These dense attention projections remain TP2-sharded with EP2.
+The existing ALLGATHER pure-decode and minimum-concurrency gates still apply;
+MegaMoe prefill does not prefetch. Missing bound targets fail startup instead
+of silently measuring an inactive feature. The routed_w2 Ascend C target remains
+an independent ND/no-EP experiment and is rejected by the EP/NZ composition flag.
+See the official API contract:
+https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_prefetch.md

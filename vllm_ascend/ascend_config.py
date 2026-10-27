@@ -35,6 +35,7 @@ from vllm_ascend.device.hardware_profile import (
     MoECommPolicy,
     get_current_hardware_profile,
 )
+from vllm_ascend.weight_prefetch_config import Qwen35WeightPrefetchConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -622,6 +623,8 @@ class AscendConfig:
     fla_chunk_size: Literal[64, 128] = 128
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
+    qwen35_weight_prefetch: Qwen35WeightPrefetchConfig = dataclasses.field(default_factory=Qwen35WeightPrefetchConfig)
+
     enable_fused_mc2: int = 0
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
@@ -673,6 +676,11 @@ class AscendConfig:
     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
     _c8_reshape_optim_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
 
+    @field_validator("qwen35_weight_prefetch", mode="before")
+    @classmethod
+    def _parse_qwen35_weight_prefetch(cls, value):
+        return value if isinstance(value, Qwen35WeightPrefetchConfig) else Qwen35WeightPrefetchConfig.parse(value)
+
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
         if self.mega_moe_prefill_token_threshold < 0:
@@ -702,6 +710,12 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.qwen35_weight_prefetch.enabled and (
+            vc.use_v2_model_runner or vc.model_config.enable_sleep_mode or vc.weight_transfer_config is not None
+        ):
+            raise ValueError(
+                "Qwen3.5 weight prefetch requires model runner v1 and static weights without sleep/transfer"
+            )
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
