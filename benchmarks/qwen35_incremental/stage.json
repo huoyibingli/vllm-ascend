@@ -1,13 +1,14 @@
 {
-  "stage": 3,
-  "branch": "test/03-fusion",
-  "previous_branch": "test/02-conv-layout",
+  "stage": 4,
+  "branch": "test/04-image-preprocess",
+  "previous_branch": "test/03-fusion",
   "base": "v0.30.0rc2",
-  "added_feature": "fusion",
+  "added_feature": "image_preprocess",
   "features": [
     "nz",
     "conv_layout",
-    "fusion"
+    "fusion",
+    "image_preprocess"
   ],
   "hardware": "Ascend A2",
   "tensor_parallel_size": 2,
@@ -21,7 +22,8 @@
     "weight_nz_mode": 2,
     "enable_flashcomm1": false,
     "multistream_overlap_shared_expert": false,
-    "enable_fused_mc2": 0
+    "enable_fused_mc2": 0,
+    "enable_qwen3_preprocess_on_npu": true
   },
   "environment": {
     "VLLM_USE_V2_MODEL_RUNNER": "0",
