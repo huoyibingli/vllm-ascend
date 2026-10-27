@@ -27,6 +27,8 @@ from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 def apply_moe_mlp(
     mlp_compute_input: MoEMlpComputeInput,
     quant_method,
+    *,
+    stage_events: dict | None = None,
 ) -> tuple[torch.Tensor, torch.npu.Event]:
     """
     Unified MoE MLP entry.
@@ -49,6 +51,8 @@ def apply_moe_mlp(
         hidden_states, act_out_scale = quant_method.apply_gmm1_act_quant(mlp_compute_input)
     else:
         hidden_states = quant_method.apply_gmm1(mlp_compute_input)
+        if stage_events is not None:
+            stage_events["before_swiglu"] = torch.npu.current_stream().record_event()
         hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
         hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
 
