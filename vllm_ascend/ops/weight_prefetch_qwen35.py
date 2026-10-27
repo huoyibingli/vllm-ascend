@@ -68,7 +68,6 @@ class Qwen35WeightPrefetch:
     def can_run(self):
         return (
             _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER
-            and not _EXTRA_CTX.flash_comm_v1_enabled
             and decode_concurrency() >= self.config.min_decode_concurrency
         )
 
@@ -193,6 +192,7 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
         or parallel.data_parallel_size != 1
         or parallel.pipeline_parallel_size != 1
         or parallel.enable_expert_parallel
+        or getattr(parallel, "use_sequence_parallel_moe", False)
         or vllm_config.quant_config is not None
         or vllm_config.lora_config is not None
         or vllm_config.speculative_config is not None
