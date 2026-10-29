@@ -1,6 +1,6 @@
 {
   "stage": 2,
-  "branch": "test/no-conv-02-fusion",
+  "branch": "test/text-02-fusion",
   "previous_branch": "test/01-nz",
   "base": "v0.30.0rc2",
   "added_feature": "fusion",
@@ -27,6 +27,8 @@
     "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
   },
   "excluded_features": [
-    "conv_shared_storage"
+    "conv_shared_storage",
+    "image_preprocess",
+    "vit_fusion"
   ]
 }
