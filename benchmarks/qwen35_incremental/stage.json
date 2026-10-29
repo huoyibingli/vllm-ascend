@@ -1,12 +1,11 @@
 {
-  "stage": 3,
-  "branch": "test/03-fusion",
-  "previous_branch": "test/02-conv-layout",
+  "stage": 2,
+  "branch": "test/no-conv-02-fusion",
+  "previous_branch": "test/01-nz",
   "base": "v0.30.0rc2",
   "added_feature": "fusion",
   "features": [
     "nz",
-    "conv_layout",
     "fusion"
   ],
   "hardware": "Ascend A2",
@@ -26,5 +25,8 @@
   "environment": {
     "VLLM_USE_V2_MODEL_RUNNER": "0",
     "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
-  }
+  },
+  "excluded_features": [
+    "conv_shared_storage"
+  ]
 }
