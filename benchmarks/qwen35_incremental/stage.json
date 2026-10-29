@@ -1,12 +1,11 @@
 {
-  "stage": 6,
-  "branch": "test/06-shared-overlap",
-  "previous_branch": "test/05-gdn-fla",
+  "stage": 5,
+  "branch": "test/no-conv-05-shared-overlap",
+  "previous_branch": "test/no-conv-04-gdn-fla",
   "base": "v0.30.0rc2",
   "added_feature": "shared_overlap",
   "features": [
     "nz",
-    "conv_layout",
     "fusion",
     "image_preprocess",
     "gdn_fla",
@@ -32,5 +31,8 @@
   "environment": {
     "VLLM_USE_V2_MODEL_RUNNER": "0",
     "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
-  }
+  },
+  "excluded_features": [
+    "conv_shared_storage"
+  ]
 }
