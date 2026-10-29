@@ -440,7 +440,6 @@ class AscendConfig:
             "enable_dsa_cp": false,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
-            "enable_qwen3_preprocess_on_npu": false,
             "enable_pcp_o_proj_weight_sharding": true,
             "enable_pcp_embedding_lmhead_weight_sharding": true,
             "draft_window_size": null,
@@ -580,9 +579,8 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: (
-            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
-        )
+        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
+        == DeviceAdaptorFamily.FP8_OPTIMIZED
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -593,7 +591,6 @@ class AscendConfig:
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
-    enable_qwen3_preprocess_on_npu: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     draft_window_size: int | None = None
