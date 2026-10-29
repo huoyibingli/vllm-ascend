@@ -1,7 +1,7 @@
 # Qwen3.5 cumulative feature benchmarks
 
 Each `test/NN-*` branch contains its predecessor and exactly one additional
-feature group. PRs #16335 and #16336 enter together at stage 03. Production
+feature group. PRs #16335 and #16336 enter together at stage 02. Production
 sources on `test/00-baseline` match tag `v0.30.0rc2`; only this benchmark harness
 is added. `stage.json` records the active switches and fixed serving profile.
 
@@ -19,9 +19,9 @@ python3 benchmarks/qwen35_incremental/run_server.py /path/to/model
 The launcher does not install dependencies, download models, or run benchmarks.
 Restart between stages and use separate compilation caches. Hold all non-feature
 configuration constant. Stage 01 tests enabling `weight_nz_mode=2`; the singleton
-NZ bug fix is already in the baseline. Stage 02 tests the new single-storage
-conv optimization, since baseline already packs convolution weights. Stage 05
-tests configurable FLA/chunk128 against the baseline fused prefill/chunk64.
+NZ bug fix is already in the baseline. The additional shared-storage conv optimization is excluded from this chain;
+baseline convolution packing remains unchanged. Stage 04 tests configurable
+FLA/chunk128 against the native default FLA/chunk64 when available.
 
 Use at least three paired repeats of image-heavy, prefill-heavy and decode-heavy
 workloads. Decode concurrency should include 1, 8, 32 and 64; prefill sizes must
@@ -55,3 +55,6 @@ pure decode ALLGATHER uses the four-phase schedule. Fused backend execution
 never waits for nonexistent GMM-stage events. Original mutex behavior remains
 unchanged when the opt-in flag is absent. Validate both paths and graph replay
 on NPU before accepting performance numbers.
+
+This no-conv test branch retains baseline convolution computation and packed
+weights, but removes the additional source/packed weight storage aliasing.

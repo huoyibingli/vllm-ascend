@@ -1,12 +1,11 @@
 {
-  "stage": 7,
-  "branch": "test/07-megamoe",
-  "previous_branch": "test/06-shared-overlap",
+  "stage": 6,
+  "branch": "test/no-conv-06-megamoe",
+  "previous_branch": "test/no-conv-05-shared-overlap",
   "base": "v0.30.0rc2",
   "added_feature": "megamoe",
   "features": [
     "nz",
-    "conv_layout",
     "fusion",
     "image_preprocess",
     "gdn_fla",
@@ -35,5 +34,8 @@
   "environment": {
     "VLLM_USE_V2_MODEL_RUNNER": "0",
     "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
-  }
+  },
+  "excluded_features": [
+    "conv_shared_storage"
+  ]
 }
