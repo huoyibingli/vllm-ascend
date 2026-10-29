@@ -94,27 +94,6 @@ def _pack_conv_weights(conv1d: nn.Module) -> None:
         .to(device=packed_param.device, dtype=packed_param.dtype)
         .contiguous()
     )
-    can_alias_storage = (
-        getattr(conv1d, "prefix", "").endswith(".linear_attn.conv1d")
-        and source_weight.ndim == 3
-        and source_weight.shape[1] == 1
-        and source_weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and source_weight.dtype == packed_param.dtype
-        and source_weight.device == packed_param.device
-        and not packed_param.is_meta
-        and not get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY)
-    )
-    if can_alias_storage:
-        # Keep both registered Parameters/checkpoint shapes, with one physical
-        # allocation. A reload copies into the already captured packed storage
-        # before restoring the source view; graph references remain stable.
-        if getattr(conv1d, "_ascend_conv_weight_aliased", False):
-            packed_param.copy_(packed_weight)
-        else:
-            packed_param.data = packed_weight
-            conv1d._ascend_conv_weight_aliased = True
-        source_weight.data = packed_param.data.transpose(0, 1).unsqueeze(1)
-        return
     replace_parameter(
         conv1d,
         _PACKED_CONV_WEIGHT_NAME,

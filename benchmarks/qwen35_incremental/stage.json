@@ -1,12 +1,11 @@
 {
-  "stage": 5,
-  "branch": "test/05-gdn-fla",
-  "previous_branch": "test/04-image-preprocess",
+  "stage": 4,
+  "branch": "test/no-conv-04-gdn-fla",
+  "previous_branch": "test/no-conv-03-image-preprocess",
   "base": "v0.30.0rc2",
   "added_feature": "gdn_fla",
   "features": [
     "nz",
-    "conv_layout",
     "fusion",
     "image_preprocess",
     "gdn_fla"
@@ -31,5 +30,8 @@
   "environment": {
     "VLLM_USE_V2_MODEL_RUNNER": "0",
     "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
-  }
+  },
+  "excluded_features": [
+    "conv_shared_storage"
+  ]
 }
