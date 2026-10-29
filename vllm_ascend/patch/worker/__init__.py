@@ -36,11 +36,9 @@ import vllm_ascend.patch.worker.patch_bind_kv_cache  # noqa
 import vllm_ascend.patch.worker.patch_step3p5  # noqa
 
 if get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
-    import vllm_ascend.patch.worker.patch_qwen2_5_vl  # noqa
     import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
     import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
     import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
-    import vllm_ascend.patch.worker.patch_qwen3_preprocess  # noqa
 else:
     import vllm_ascend.patch.worker.patch_idex_310  # noqa
     import vllm_ascend.patch.worker.patch_v2.patch_spec_decode_310  # noqa

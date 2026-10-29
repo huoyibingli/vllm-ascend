@@ -1,13 +1,12 @@
 {
-  "stage": 5,
-  "branch": "test/no-conv-05-shared-overlap",
-  "previous_branch": "test/no-conv-04-gdn-fla",
+  "stage": 4,
+  "branch": "test/text-04-shared-overlap",
+  "previous_branch": "test/text-03-gdn-fla",
   "base": "v0.30.0rc2",
   "added_feature": "shared_overlap",
   "features": [
     "nz",
     "fusion",
-    "image_preprocess",
     "gdn_fla",
     "shared_overlap"
   ],
@@ -24,7 +23,6 @@
     "enable_flashcomm1": false,
     "multistream_overlap_shared_expert": true,
     "enable_fused_mc2": 0,
-    "enable_qwen3_preprocess_on_npu": true,
     "enable_fla_gdn": true,
     "fla_chunk_size": 128
   },
@@ -33,6 +31,8 @@
     "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
   },
   "excluded_features": [
-    "conv_shared_storage"
+    "conv_shared_storage",
+    "image_preprocess",
+    "vit_fusion"
   ]
 }
