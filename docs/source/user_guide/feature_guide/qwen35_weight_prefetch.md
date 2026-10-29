@@ -7,14 +7,14 @@ This experimental feature overlaps bounded weight prefetches with decode work fo
 The supported targets are:
 
 - `next_input`: prefetch the next layer's fused GDN input or full-attention QKV weight while tensor-parallel all-reduce is queued.
-- `gdn_out`: prefetch the current GDN layer's output projection during its attention work.
+- `gdn_out`: prefetch the next GDN layer's output projection across the preceding MoE collective and attention work; layer zero falls back to same-layer prefetch.
 - `routed_w2`: warm a budgeted portion of active experts' `w2` weights before the down projection. This target requires the optional Ascend C extension described below.
 
 ## Compatibility
 
-The current implementation is limited to Ascend A2/910B, Qwen3.5-35B-A3B's 40-layer text model, BF16, TP=2, DP=1, PP=1, with expert parallelism, quantization, LoRA, and speculative decoding disabled. Unsupported model or topology combinations leave the regular model path in use. Sleep mode, weight transfer, and weight reload are not supported while the feature is enabled because graph capture is tied to the loaded weight storage.
+The current implementation is limited to Ascend A2/910B, Qwen3.5-35B-A3B's 40-layer text model, BF16, TP=2, DP=1, PP=1, with quantization, LoRA, and speculative decoding disabled. EP2 and dense ND/NZ weights can be explicitly enabled using `allow_ep_nz_dense=true`; routed_w2 remains excluded in that composition. Without that opt-in, unsupported model or topology combinations leave the regular model path in use. The dense EP/NZ opt-in rejects unsupported topology or missing targets instead of silently reporting an active experiment. Sleep mode, weight transfer, and weight reload are not supported while the feature is enabled because graph capture is tied to the loaded weight storage.
 
-Model runner v1 is required. Use `weight_nz_mode=0` for the supported ND storage and `enable_flashcomm1=false` for the ALLGATHER path. NZ weights are deliberately excluded.
+Model runner v1 is required. Use `weight_nz_mode=0` for the supported ND storage and `enable_flashcomm1=false` for the ALLGATHER path. NZ weights require the explicit dense EP/NZ opt-in above.
 
 Configuration is read at model startup. Restart the service and use a fresh compilation cache when changing it.
 
@@ -32,6 +32,7 @@ The default is equivalent to `{"enabled": false}`. The supported fields are:
 
 | Field | Default | Description |
 |---|---:|---|
+| `allow_ep_nz_dense` | `false` | Opt in to validated TP2/EP2 dense ND/NZ projection weights; excludes routed_w2. |
 | `enabled` | `false` | Master switch. |
 | `mode` | `"full"` | `"full"` issues prefetch transfers; `"control"` keeps stream/wait plumbing without data movement. |
 | `targets` | `["next_input"]` | Any non-empty, duplicate-free combination of `next_input`, `gdn_out`, and `routed_w2`. |
@@ -64,3 +65,27 @@ Stop inference services before running the script; it checks for running vLLM pr
 ## Validation guidance
 
 The feature is opt-in and experimental. Compare prefetch-off and prefetch-on runs with the same model, prompt set, output length, graph mode, parallel settings, and cache state. Check output consistency, target-operator and consumer-wait timing, throughput, median and tail latency, and whether the dependency window regresses. Aggregate benchmark summaries alone do not establish that prefetch caused a change. Keep the feature disabled if the result is neutral, unstable, or slower.
+
+## Independent input/output prefetch timelines
+
+When both dense targets are enabled, input and GDN output weights use separate
+side streams. The existing immediate/deferred input join only waits for the
+input stream. Output prefetch snapshots the dependency before the preceding
+collective, submits after the collective is enqueued, and waits immediately
+before the target out_proj consumes the weight. The first GDN layer retains
+the same-layer fallback. Single-target configurations keep one side stream.
+
+A pending output prefetch suppresses duplicate same-layer submissions. The
+routed completion buffer and extension are allocated only for routed_w2.
+Control mode retains the same waits without data movement. Reloaded/replaced
+weights remain guarded by identity, storage address and shape checks.
+
+This scheduling change needs NPU graph capture/replay, output consistency and
+performance validation. Earlier output-weight fetches may be evicted or contend
+for bandwidth; no performance improvement is claimed without measurement.
+Keep byte budgets, minimum decode concurrency and all serving settings fixed
+when comparing the original and candidate implementation.
+
+For the 40-layer model with both dense targets bound, the startup log should
+report `next_inputs=39`, `gdn_out=30` and `gdn_lookahead=29`. This confirms
+binding only; inspect the device timeline to confirm overlap and cache effects.
