@@ -175,5 +175,6 @@ def test_tp2_ep2_nz_bind_with_megamoe_weight_lists(monkeypatch, usable_weights):
     prefetch_module.bind_qwen35_weight_prefetch(model, runtime, config)
     assert len(controller.next_inputs) == 39
     assert len(controller.gdn_out_weights) == 30
+    assert len(controller.next_gdn_out) == 29
     assert not controller.routed_weights
     assert model._qwen35_weight_prefetch is controller

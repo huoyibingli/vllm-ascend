@@ -54,6 +54,14 @@ class Qwen35WeightPrefetch:
     def __init__(self, config, device):
         self.config = config
         self.stream = torch.npu.Stream(device=device)
+        # An input-projection join must not also wait for the later GDN output
+        # projection. Separate timelines let both weights overlap the preceding
+        # MoE collective without forcing the GDN prefetch to finish at layer entry.
+        self.gdn_out_stream = (
+            torch.npu.Stream(device=device)
+            if "next_input" in config.targets and "gdn_out" in config.targets
+            else self.stream
+        )
         self.next_inputs = {}
         self.pending_next_input = set()
         self.inline_next_input_join = False
@@ -61,9 +69,10 @@ class Qwen35WeightPrefetch:
         self.next_gdn_out = {}
         self.pending_gdn_out = set()
         self.routed_weights = {}
-        self.done = torch.empty((config.vector_cores, 4), dtype=torch.int64, device=device)
+        self.done = None
         self.extension = None
         if "routed_w2" in config.targets:
+            self.done = torch.empty((config.vector_cores, 4), dtype=torch.int64, device=device)
             self.extension = importlib.import_module("vllm_ascend.ops._qwen35_routed_prefetch")
 
     def can_run(self):
@@ -74,7 +83,7 @@ class Qwen35WeightPrefetch:
 
     def begin_next(self, layer_name, states):
         entry = self.next_inputs.get(layer_name)
-        if entry is None or not self.can_run():
+        if entry is None or layer_name in self.pending_next_input or not self.can_run():
             return False
         projection, identity, address, shape, size, immediate = entry
         weight = projection.weight
@@ -107,7 +116,7 @@ class Qwen35WeightPrefetch:
 
     def prepare_next_gdn_out(self, source_layer_name, dependency):
         target_layer_name = self.next_gdn_out.get(source_layer_name)
-        if target_layer_name is None or not self.can_run():
+        if target_layer_name is None or target_layer_name in self.pending_gdn_out or not self.can_run():
             return None
         entry = self.gdn_out_weights.get(target_layer_name)
         if entry is None:
@@ -117,27 +126,27 @@ class Qwen35WeightPrefetch:
         if weight is not identity or weight.data_ptr() != address or tuple(weight.shape) != shape:
             return None
         # Snapshot only the pre-collective dependency; submit CMO after the collective is enqueued.
-        self.stream.wait_stream(torch.npu.current_stream())
+        self.gdn_out_stream.wait_stream(torch.npu.current_stream())
         return target_layer_name, weight, dependency, size
 
     def commit_next_gdn_out(self, prepared):
         target_layer_name, weight, dependency, size = prepared
-        with torch.npu.stream(self.stream):
+        with torch.npu.stream(self.gdn_out_stream):
             if self.config.mode == "full":
                 torch_npu.npu_prefetch(weight, dependency, size, 0)
         self.pending_gdn_out.add(target_layer_name)
 
     def begin_gdn_out(self, layer_name, dependency):
         entry = self.gdn_out_weights.get(layer_name)
-        if entry is None or not self.can_run() or layer_name in self.pending_gdn_out:
+        if entry is None or layer_name in self.pending_gdn_out or not self.can_run():
             return False
         projection, identity, address, shape, size = entry
         weight = projection.weight
         if weight is not identity or weight.data_ptr() != address or tuple(weight.shape) != shape:
             return False
         main = torch.npu.current_stream()
-        self.stream.wait_stream(main)
-        with torch.npu.stream(self.stream):
+        self.gdn_out_stream.wait_stream(main)
+        with torch.npu.stream(self.gdn_out_stream):
             if self.config.mode == "full":
                 torch_npu.npu_prefetch(weight, dependency, size, 0)
         self.pending_gdn_out.add(layer_name)
@@ -146,7 +155,7 @@ class Qwen35WeightPrefetch:
     def join_gdn_out(self, layer_name):
         if layer_name in self.pending_gdn_out:
             self.pending_gdn_out.remove(layer_name)
-            self.join()
+            torch.npu.current_stream().wait_stream(self.gdn_out_stream)
 
     def begin_routed(self, weight, groups, dependency, position, group_list_type):
         if position != self.config.routed_start or group_list_type != 1 or not self.can_run():
@@ -304,9 +313,10 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
             size,
             "deferred" if deferred else "immediate",
         )
-    # When next_input is enabled, its existing immediate join shares this stream;
-    # keep gdn_out on its same-layer path rather than joining it too early.
-    if "gdn_out" in config.targets and "next_input" not in config.targets:
+    # GDN output weights use their own timeline when next_input is enabled.
+    # Its input join cannot drain this later prefetch; the GDN consumer joins
+    # immediately before out_proj. Layer zero retains the same-layer fallback.
+    if "gdn_out" in config.targets:
         for index, target_layer in enumerate(layers[1:], start=1):
             if target_layer.layer_type != "linear_attention":
                 continue
@@ -329,10 +339,12 @@ def bind_qwen35_weight_prefetch(model, vllm_config, config):
             _unbind(model, f"no bound storage for requested targets {missing}")
             raise RuntimeError(f"Qwen3.5 cumulative prefetch has no bound storage for {missing}")
     logger.info(
-        "Qwen3.5 prefetch bound: next_inputs=%d routed_w2=%d gdn_out=%d mode=%s join=%s budgets=%s/%s/%s",
+        "Qwen3.5 prefetch bound: next_inputs=%d routed_w2=%d gdn_out=%d gdn_lookahead=%d "
+        "mode=%s join=%s budgets=%s/%s/%s",
         len(controller.next_inputs),
         len(controller.routed_weights),
         len(controller.gdn_out_weights),
+        len(controller.next_gdn_out),
         config.mode,
         config.next_input_join,
         config.next_input_bytes,
