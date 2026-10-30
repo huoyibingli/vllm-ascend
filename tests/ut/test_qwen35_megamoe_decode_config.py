@@ -13,7 +13,6 @@ def setup_config():
     config.allow_megamoe_shared_expert_overlap = True
     config._supports_megamoe_shared_expert_overlap = lambda _: True
     config.weight_nz_mode = 2
-    config.enable_flashcomm1 = False
     config.enable_force_eplb = False
     config.eplb_config = SimpleNamespace(dynamic_eplb=False)
     runtime = SimpleNamespace(
@@ -37,7 +36,10 @@ def setup_config():
 
 def test_supported_static_configuration():
     config, runtime = setup_config()
-    config._validate_qwen35_megamoe_decode_nz(runtime)
+    # FlashComm is deliberately not an AscendConfig field. The production
+    # derivation computes it from additional_config, the environment and DSA-CP.
+    assert not hasattr(config, "enable_flashcomm1")
+    config._validate_qwen35_megamoe_decode_nz(runtime, effective_flashcomm=False)
 
 
 @pytest.mark.parametrize(
@@ -45,7 +47,6 @@ def test_supported_static_configuration():
     [
         ("config", "weight_nz_mode", 1),
         ("config", "allow_megamoe_shared_expert_overlap", False),
-        ("config", "enable_flashcomm1", True),
         ("config", "enable_force_eplb", True),
         ("runtime", "use_v2_model_runner", True),
         ("runtime", "weight_transfer_config", object()),
@@ -73,11 +74,18 @@ def test_unsupported_configuration_is_rejected(target, name, value):
     )
     setattr(owners[target], name, value)
     with pytest.raises(ValueError, match="static A2"):
-        config._validate_qwen35_megamoe_decode_nz(runtime)
+        config._validate_qwen35_megamoe_decode_nz(runtime, effective_flashcomm=False)
 
 
 def test_missing_megamoe_or_shared_support_is_rejected():
     config, runtime = setup_config()
     config._supports_megamoe_shared_expert_overlap = lambda _: False
     with pytest.raises(ValueError, match="static A2"):
-        config._validate_qwen35_megamoe_decode_nz(runtime)
+        config._validate_qwen35_megamoe_decode_nz(runtime, effective_flashcomm=False)
+
+
+def test_effective_flashcomm_is_rejected_without_reading_a_config_field():
+    config, runtime = setup_config()
+    assert not hasattr(config, "enable_flashcomm1")
+    with pytest.raises(ValueError, match="static A2"):
+        config._validate_qwen35_megamoe_decode_nz(runtime, effective_flashcomm=True)
