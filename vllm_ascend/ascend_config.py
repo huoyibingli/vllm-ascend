@@ -35,6 +35,7 @@ from vllm_ascend.device.hardware_profile import (
     MoECommPolicy,
     get_current_hardware_profile,
 )
+from vllm_ascend.qwen35_megamoe_config import Qwen35MegaMoeDecodeNZConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -585,6 +586,9 @@ class AscendConfig:
     multistream_overlap_shared_expert: bool = False
     # Opt-in A2 phase-aware benchmark composition; default mutex remains unchanged.
     allow_megamoe_shared_expert_overlap: bool = False
+    qwen35_megamoe_decode_nz: Qwen35MegaMoeDecodeNZConfig = dataclasses.field(
+        default_factory=Qwen35MegaMoeDecodeNZConfig
+    )
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
@@ -670,6 +674,11 @@ class AscendConfig:
     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
     _c8_reshape_optim_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
 
+    @field_validator("qwen35_megamoe_decode_nz", mode="before")
+    @classmethod
+    def _parse_qwen35_megamoe_decode_nz(cls, value):
+        return value if isinstance(value, Qwen35MegaMoeDecodeNZConfig) else Qwen35MegaMoeDecodeNZConfig.parse(value)
+
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
         if self.mega_moe_prefill_token_threshold < 0:
@@ -699,6 +708,8 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.qwen35_megamoe_decode_nz.enabled:
+            self._validate_qwen35_megamoe_decode_nz(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -1072,6 +1083,36 @@ class AscendConfig:
         if self.mix_placement:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
+
+    def _validate_qwen35_megamoe_decode_nz(self, vc: VllmConfig) -> None:
+        parallel = vc.parallel_config
+        hf = vc.model_config.hf_text_config
+        if (
+            not self.allow_megamoe_shared_expert_overlap
+            or not self._supports_megamoe_shared_expert_overlap(vc)
+            or self.weight_nz_mode != 2
+            or self.enable_flashcomm1
+            or parallel.tensor_parallel_size != 2
+            or parallel.prefill_context_parallel_size != 1
+            or getattr(parallel, "decode_context_parallel_size", 1) != 1
+            or getattr(parallel, "use_sequence_parallel_moe", False)
+            or getattr(hf, "model_type", None) != "qwen3_5_moe_text"
+            or tuple(
+                getattr(hf, name, None)
+                for name in ("num_hidden_layers", "hidden_size", "num_experts", "moe_intermediate_size")
+            )
+            != (40, 2048, 256, 512)
+            or str(vc.model_config.dtype) != "torch.bfloat16"
+            or vc.use_v2_model_runner
+            or vc.model_config.enable_sleep_mode
+            or vc.weight_transfer_config is not None
+            or self.eplb_config.dynamic_eplb
+            or self.enable_force_eplb
+        ):
+            raise ValueError(
+                "qwen35_megamoe_decode_nz requires static A2 Qwen3.5-35B BF16 TP2/EP2 DP1/PP1 "
+                "with NZ mode2, MegaMoe/shared overlap and runner v1; no SP/CP, FlashComm, sleep, transfer or EPLB"
+            )
 
     def _supports_megamoe_shared_expert_overlap(self, vllm_config: VllmConfig) -> bool:
         profile = get_current_hardware_profile()

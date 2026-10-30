@@ -39,6 +39,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.force_eplb import get_force_eplb_topk
+from vllm_ascend.ops.fused_moe.megamoe_decode_nz import get_decode_nz_weights
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     FusedExpertsResult,
@@ -110,12 +111,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
         replace_parameter(layer, "w2_weight", w2_data)
 
-        # TODO: Current dispatch_ffn_combine/mega_moe fusion operator ONLY supports NZ format.
-        # Therefore, we must cast weights to NZ when fusion is enabled.
-        # Once the underlying dispatch_ffn_combine/mega_moe operator is updated to support
-        # ND format (or other formats), remove this specific 'if' check and the forced
-        # npu_format_cast. At that point, the operator should be able to handle weights
-        # in their native format without explicit casting here.
+        # dispatch_ffn_combine requires NZ. A2 BF16 MegaMoe instead requires
+        # per-expert 2D ND lists; quantized MegaMoe methods own their NZ packing.
+        # Optional Qwen3.5 NZ caches for ordinary GMM are bound after the model
+        # load, without replacing the ND lists passed to BF16 MegaMoe.
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2:
             use_megamoe = use_cann_megamoe(get_current_vllm_config())
@@ -208,6 +207,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         )
 
     def get_mlp_weights(self, layer):
+        cached = get_decode_nz_weights(layer)
+        if cached is not None:
+            return cached
         w13_weight_list = getattr(layer, "w13_weight_list", None)
         w2_weight_list = getattr(layer, "w2_weight_list", None)
         w1 = w13_weight_list if isinstance(w13_weight_list, list) else layer.w13_weight
@@ -788,6 +790,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if self.return_with_event:
             return routed_out, RoutedMoEMilestones(
                 routed_dispatch_start=fused_experts_results.before_dispatch_evt,
+                routed_fused_start=fused_experts_results.fused_moe_start_evt,
                 routed_mlp_start=fused_experts_results.before_moe_up_evt,
                 routed_activation_start=fused_experts_results.before_swiglu_evt,
                 routed_gmm2_start=fused_experts_results.before_gmm2_evt,

@@ -1,6 +1,6 @@
 {
   "stage": 5,
-  "branch": "test/text-05-megamoe",
+  "branch": "test/text-05-megamoe-nz-shared-v2",
   "previous_branch": "test/text-04-shared-overlap",
   "base": "v0.30.0rc2",
   "added_feature": "megamoe",
@@ -15,10 +15,10 @@
   "tensor_parallel_size": 2,
   "enable_expert_parallel": true,
   "dtype": "bfloat16",
-  "seed": 42,
-  "max_model_len": 16384,
+  "seed": 1024,
+  "max_model_len": 32768,
   "max_num_batched_tokens": 16384,
-  "max_num_seqs": 64,
+  "max_num_seqs": 32,
   "additional_config": {
     "weight_nz_mode": 2,
     "enable_flashcomm1": false,
@@ -27,15 +27,30 @@
     "enable_fla_gdn": true,
     "fla_chunk_size": 128,
     "allow_megamoe_shared_expert_overlap": true,
-    "mega_moe_prefill_token_threshold": 64
+    "mega_moe_prefill_token_threshold": 64,
+    "mega_moe_max_tokens": 131072,
+    "qwen35_megamoe_decode_nz": {
+      "enabled": true,
+      "layers": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "max_cache_bytes": 4294967296
+    }
   },
-  "environment": {
-    "VLLM_USE_V2_MODEL_RUNNER": "0",
-    "VLLM_ASCEND_VIT_FUSED_QKV_ROPE_PAD_STATS": "0"
-  },
+  "environment": {},
   "excluded_features": [
     "conv_shared_storage",
     "image_preprocess",
     "vit_fusion"
-  ]
+  ],
+  "adaptation": {
+    "parent_branch": "test/text-05-megamoe",
+    "decode_nz_cached_layers": 4,
+    "total_layers": 40,
+    "extra_cache_bytes_per_rank": 3221225472,
+    "npu_validated": false
+  }
 }

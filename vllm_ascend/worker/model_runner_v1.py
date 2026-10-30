@@ -4377,6 +4377,22 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    def _bind_qwen35_megamoe_decode_nz(self) -> None:
+        if not self.ascend_config.qwen35_megamoe_decode_nz.enabled:
+            return
+        from vllm_ascend.ops.fused_moe.megamoe_decode_nz import bind_qwen35_megamoe_decode_nz
+
+        allocated_before = torch.npu.memory_allocated(self.device)
+        bind_qwen35_megamoe_decode_nz(self.model, self.ascend_config.qwen35_megamoe_decode_nz)
+        extra_bytes = torch.npu.memory_allocated(self.device) - allocated_before
+        self.model_memory_usage += extra_bytes
+        logger.info("Qwen3.5 decode NZ cache added %d bytes to model memory accounting", extra_bytes)
+
+    def reload_weights(self, *args, **kwargs) -> None:
+        if self.ascend_config.qwen35_megamoe_decode_nz.enabled:
+            raise RuntimeError("Restart with qwen35_megamoe_decode_nz disabled before reloading weights")
+        return super().reload_weights(*args, **kwargs)
+
     def load_model(self) -> None:
         from vllm_ascend.model_executor.warmup.early_kernel_warmup import (
             join_early_kernel_warmup,
@@ -4484,6 +4500,8 @@ class NPUModelRunner(GPUModelRunner):
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         get_offloader().post_init()
+        self._bind_qwen35_megamoe_decode_nz()
+
         if self.sparse_kv_offload_enabled and self.sparse_kv_offload_config.use_fused_copy_sfa:
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 
