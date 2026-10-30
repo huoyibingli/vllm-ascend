@@ -1,7 +1,7 @@
 # Qwen3.5 text-only cumulative tests
 
 Stages: 01 NZ, 02 text fusion, 03 FLA GDN chunk128, 04 shared-expert
-four-phase overlap, 05 weight prefetch v2. MegaMoe is excluded. Each stage keeps the
+four-phase overlap, 05 weight prefetch v2. MegaMoe will be added last at stage 06. Each stage keeps the
 preceding text features. Extra conv shared storage, image preprocessing
 and ViT-only fusion are excluded; baseline conv packing is retained.
 Use the fixed external production runbook for serving and benchmark commands.

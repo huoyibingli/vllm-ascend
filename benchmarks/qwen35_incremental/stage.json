@@ -1,6 +1,6 @@
 {
   "stage": 5,
-  "branch": "test/text-05-prefetch-v2-no-megamoe",
+  "branch": "test/text-05-weight-prefetch",
   "previous_branch": "test/text-04-shared-overlap",
   "base": "v0.30.0rc2",
   "added_feature": "weight_prefetch",
