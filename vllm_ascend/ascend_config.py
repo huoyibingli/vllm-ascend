@@ -723,8 +723,6 @@ class AscendConfig:
                 "Qwen3.5 weight prefetch requires model runner v1 and static weights without sleep/transfer"
             )
 
-        if self.qwen35_megamoe_decode_nz.enabled:
-            self._validate_qwen35_megamoe_decode_nz(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -812,6 +810,9 @@ class AscendConfig:
             logger.warning_once("FlashComm1 is enabled, but the current config does not support sp MoE. Disabling")
         else:
             logger.info_once("FlashComm1 is enabled.")
+
+        if self.qwen35_megamoe_decode_nz.enabled:
+            self._validate_qwen35_megamoe_decode_nz(vc, effective_flashcomm)
 
         if self.enable_dsa_cp:
             tp_size = vc.parallel_config.tensor_parallel_size
@@ -1099,14 +1100,14 @@ class AscendConfig:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
 
-    def _validate_qwen35_megamoe_decode_nz(self, vc: VllmConfig) -> None:
+    def _validate_qwen35_megamoe_decode_nz(self, vc: VllmConfig, effective_flashcomm: bool) -> None:
         parallel = vc.parallel_config
         hf = vc.model_config.hf_text_config
         if (
             not self.allow_megamoe_shared_expert_overlap
             or not self._supports_megamoe_shared_expert_overlap(vc)
             or self.weight_nz_mode != 2
-            or self.enable_flashcomm1
+            or effective_flashcomm
             or parallel.tensor_parallel_size != 2
             or parallel.prefill_context_parallel_size != 1
             or getattr(parallel, "decode_context_parallel_size", 1) != 1
