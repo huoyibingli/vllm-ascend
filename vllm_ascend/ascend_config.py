@@ -29,7 +29,13 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import (
+    DeviceAdaptorFamily,
+    HardwareCapability,
+    MoECommPolicy,
+    get_current_hardware_profile,
+)
+from vllm_ascend.qwen35_megamoe_config import Qwen35MegaMoeDecodeNZConfig
 from vllm_ascend.weight_prefetch_config import Qwen35WeightPrefetchConfig
 
 if TYPE_CHECKING:
@@ -579,6 +585,11 @@ class AscendConfig:
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
+    # Opt-in A2 phase-aware benchmark composition; default mutex remains unchanged.
+    allow_megamoe_shared_expert_overlap: bool = False
+    qwen35_megamoe_decode_nz: Qwen35MegaMoeDecodeNZConfig = dataclasses.field(
+        default_factory=Qwen35MegaMoeDecodeNZConfig
+    )
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
@@ -600,6 +611,7 @@ class AscendConfig:
     # count exceeds it, tokens may be truncated, causing precision
     # degradation. Do not set it too large because workspace memory scales
     # linearly with this value. Default 65536.
+    mega_moe_prefill_token_threshold: int = 64
     mega_moe_max_tokens: int = 65536
     ascend_log_path: str = dataclasses.field(
         default_factory=lambda: os.path.join(os.path.expanduser("~"), "ascend", "log", "vllm_ascend")
@@ -670,8 +682,15 @@ class AscendConfig:
     def _parse_qwen35_weight_prefetch(cls, value):
         return value if isinstance(value, Qwen35WeightPrefetchConfig) else Qwen35WeightPrefetchConfig.parse(value)
 
+    @field_validator("qwen35_megamoe_decode_nz", mode="before")
+    @classmethod
+    def _parse_qwen35_megamoe_decode_nz(cls, value):
+        return value if isinstance(value, Qwen35MegaMoeDecodeNZConfig) else Qwen35MegaMoeDecodeNZConfig.parse(value)
+
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.mega_moe_prefill_token_threshold < 0:
+            raise ValueError("mega_moe_prefill_token_threshold must be non-negative")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
@@ -703,6 +722,9 @@ class AscendConfig:
             raise ValueError(
                 "Qwen3.5 weight prefetch requires model runner v1 and static weights without sleep/transfer"
             )
+
+        if self.qwen35_megamoe_decode_nz.enabled:
+            self._validate_qwen35_megamoe_decode_nz(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -859,7 +881,16 @@ class AscendConfig:
             "MiniMax M3 does not support enable_fused_mc2=1 (dispatch_ffn_combine). "
             "Set additional_config.enable_fused_mc2 to 2 to enable MegaMoe, or 0 to disable fused MC2."
         )
-        if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
+        if self.allow_megamoe_shared_expert_overlap:
+            if not self._supports_megamoe_shared_expert_overlap(vc):
+                raise ValueError(
+                    "allow_megamoe_shared_expert_overlap requires A2 MegaMoe, shared overlap, "
+                    "EP, DP1/PP1, and no quantization, LoRA or speculative decoding"
+                )
+            logger.info_once(
+                "A2 MegaMoe/shared-expert overlap composition enabled; scheduling follows runtime milestones"
+            )
+        elif self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
             self.multistream_overlap_shared_expert = False
             logger.warning_once(
                 "enable_fused_mc2 and multistream_overlap_shared_expert "
@@ -1068,6 +1099,54 @@ class AscendConfig:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
 
+    def _validate_qwen35_megamoe_decode_nz(self, vc: VllmConfig) -> None:
+        parallel = vc.parallel_config
+        hf = vc.model_config.hf_text_config
+        if (
+            not self.allow_megamoe_shared_expert_overlap
+            or not self._supports_megamoe_shared_expert_overlap(vc)
+            or self.weight_nz_mode != 2
+            or self.enable_flashcomm1
+            or parallel.tensor_parallel_size != 2
+            or parallel.prefill_context_parallel_size != 1
+            or getattr(parallel, "decode_context_parallel_size", 1) != 1
+            or getattr(parallel, "use_sequence_parallel_moe", False)
+            or getattr(hf, "model_type", None) != "qwen3_5_moe_text"
+            or tuple(
+                getattr(hf, name, None)
+                for name in ("num_hidden_layers", "hidden_size", "num_experts", "moe_intermediate_size")
+            )
+            != (40, 2048, 256, 512)
+            or str(vc.model_config.dtype) != "torch.bfloat16"
+            or vc.use_v2_model_runner
+            or vc.model_config.enable_sleep_mode
+            or vc.weight_transfer_config is not None
+            or self.eplb_config.dynamic_eplb
+            or self.enable_force_eplb
+        ):
+            raise ValueError(
+                "qwen35_megamoe_decode_nz requires static A2 Qwen3.5-35B BF16 TP2/EP2 DP1/PP1 "
+                "with NZ mode2, MegaMoe/shared overlap and runner v1; no SP/CP, FlashComm, sleep, transfer or EPLB"
+            )
+
+    def _supports_megamoe_shared_expert_overlap(self, vllm_config: VllmConfig) -> bool:
+        profile = get_current_hardware_profile()
+        parallel = vllm_config.parallel_config
+        return (
+            self.enable_fused_mc2 == 1
+            and self.multistream_overlap_shared_expert
+            and is_mega_moe_supported()
+            and profile.supports(HardwareCapability.CANN_MEGAMOE)
+            and profile.moe_comm_policy is MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY
+            and parallel.enable_expert_parallel
+            and parallel.data_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and vllm_config.quant_config is None
+            and vllm_config.lora_config is None
+            and vllm_config.speculative_config is None
+            and self._is_megamoe_supported_by_config(vllm_config)
+        )
+
     @staticmethod
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
         if get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP):
@@ -1089,7 +1168,7 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
-        if moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
+        if moe_intermediate_size < 512 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
             return False
 
         quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))

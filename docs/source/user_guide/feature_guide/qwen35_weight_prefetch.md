@@ -74,10 +74,12 @@ and `gdn_out`. Budgets remain bounded by the logical weight byte count,
 which does not require interpreting NZ expert strides. No conversion or
 weight replacement is performed. The routed_w2 target is excluded from this
 composition because its kernel expects contiguous ND expert storage.
-This benchmark branch keeps `weight_nz_mode=2` and shared overlap, excludes
-MegaMoe changes, and sets `enable_fused_mc2=0`. Prefetch applies only to
-pure-decode ALLGATHER. It starts from `test/text-04-shared-overlap` and adds
-the v2 prefetch implementation, preserving the preceding expert weight layout.
+Stage05 (`test/text-05-weight-prefetch`) keeps NZ mode2 and shared overlap,
+with fused MC2 disabled. Stage06 (`test/text-06-megamoe`) adds MegaMoe last
+and optionally binds per-layer NZ caches for ordinary GMM. Both stages use
+the same v2 dense prefetch implementation on pure-decode ALLGATHER, with
+only next_input and gdn_out enabled. Routed expert caches do not replace
+the dense projections targeted by prefetch.
 NPU capture/replay, correctness and performance validation remain required.
 
 ## Independent input/output prefetch timelines

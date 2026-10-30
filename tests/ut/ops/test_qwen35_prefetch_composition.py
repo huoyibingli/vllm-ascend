@@ -94,8 +94,8 @@ def test_prefetch_join_and_shared_milestone_order(monkeypatch):
 
 
 @pytest.mark.parametrize("usable_weights", [True, False])
-@pytest.mark.parametrize("expert_lists", [True, False])
-def test_tp2_ep2_nz_bind_with_expert_storage(monkeypatch, usable_weights, expert_lists):
+@pytest.mark.parametrize("expert_storage", ["stacked", "lists", "lists_with_nz_cache"])
+def test_tp2_ep2_nz_bind_with_expert_storage(monkeypatch, usable_weights, expert_storage):
     class Layer:
         pass
 
@@ -148,8 +148,13 @@ def test_tp2_ep2_nz_bind_with_expert_storage(monkeypatch, usable_weights, expert
         owner.layer_name = f"model.language_model.model.layers.{index}.mlp"
         # Dense prefetch must work with either native NZ or expert-list storage.
         owner.routed_experts = (
-            SimpleNamespace(w2_weight_list=[]) if expert_lists else SimpleNamespace(w2_weight=Weight((128, 2048, 512)))
+            SimpleNamespace(w2_weight_list=[])
+            if expert_storage != "stacked"
+            else SimpleNamespace(w2_weight=Weight((128, 2048, 512)))
         )
+        if expert_storage == "lists_with_nz_cache":
+            owner.routed_experts._qwen35_decode_w13_nz = object()
+            owner.routed_experts._qwen35_decode_w2_nz = object()
         layer.mlp = SimpleNamespace(modules=lambda owner=owner: iter([owner]))
         layers.append(layer)
     model = SimpleNamespace(modules=lambda: iter(layers), parameters=lambda: iter([Weight((2, 2))]))

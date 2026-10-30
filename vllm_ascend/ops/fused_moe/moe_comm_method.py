@@ -90,6 +90,7 @@ class FusedExpertsResult:
     # For dynamic_eplb
     group_list_type: int = 1
     expert_tokens: torch.Tensor | None = None
+    fused_moe_start_evt: torch.npu.Event | None = None
 
 
 class MoECommMethod(ABC):
@@ -586,6 +587,14 @@ class FusedMC2CommImpl(MoECommMethod):
         )
 
         expert_tokens = None
+        fused_moe_start_evt = None
+        config = get_ascend_config()
+        if (
+            _EXTRA_CTX.use_mega_moe
+            and getattr(config, "allow_megamoe_shared_expert_overlap", False)
+            and config.multistream_overlap_shared_expert
+        ):
+            fused_moe_start_evt = torch.npu.current_stream().record_event()
         if self.enable_fused_mc2 == 1:
             if _EXTRA_CTX.use_mega_moe:
                 out, expert_tokens = self._apply_cann_mega_moe(
@@ -621,4 +630,5 @@ class FusedMC2CommImpl(MoECommMethod):
         return FusedExpertsResult(
             routed_out=out,
             expert_tokens=expert_tokens,
+            fused_moe_start_evt=fused_moe_start_evt,
         )

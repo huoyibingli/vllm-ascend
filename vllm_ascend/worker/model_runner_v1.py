@@ -4344,7 +4344,7 @@ class NPUModelRunner(GPUModelRunner):
 
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
-            mc2_tokens_capacity, self.vllm_config
+            mc2_tokens_capacity, self.vllm_config, in_profile_run=True
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
             # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
             with disable_compilation(self.get_model()):
@@ -4377,9 +4377,20 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    def _bind_qwen35_megamoe_decode_nz(self) -> None:
+        if not self.ascend_config.qwen35_megamoe_decode_nz.enabled:
+            return
+        from vllm_ascend.ops.fused_moe.megamoe_decode_nz import bind_qwen35_megamoe_decode_nz
+
+        allocated_before = torch.npu.memory_allocated(self.device)
+        bind_qwen35_megamoe_decode_nz(self.model, self.ascend_config.qwen35_megamoe_decode_nz)
+        extra_bytes = torch.npu.memory_allocated(self.device) - allocated_before
+        self.model_memory_usage += extra_bytes
+        logger.info("Qwen3.5 decode NZ cache added %d bytes to model memory accounting", extra_bytes)
+
     def reload_weights(self, *args, **kwargs) -> None:
-        if self.ascend_config.qwen35_weight_prefetch.enabled:
-            raise RuntimeError("Restart with Qwen3.5 weight prefetch disabled before reloading captured weights")
+        if self.ascend_config.qwen35_weight_prefetch.enabled or self.ascend_config.qwen35_megamoe_decode_nz.enabled:
+            raise RuntimeError("Restart with Qwen3.5 prefetch and decode NZ cache disabled before reloading weights")
         return super().reload_weights(*args, **kwargs)
 
     def load_model(self) -> None:
@@ -4489,6 +4500,7 @@ class NPUModelRunner(GPUModelRunner):
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         get_offloader().post_init()
+        self._bind_qwen35_megamoe_decode_nz()
         if self.ascend_config.qwen35_weight_prefetch.enabled:
             from vllm_ascend.ops.weight_prefetch_qwen35 import bind_qwen35_weight_prefetch
 

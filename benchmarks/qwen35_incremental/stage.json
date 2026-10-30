@@ -1,15 +1,16 @@
 {
-  "stage": 5,
-  "branch": "test/text-05-weight-prefetch",
-  "previous_branch": "test/text-04-shared-overlap",
+  "stage": 6,
+  "branch": "test/text-06-megamoe",
+  "previous_branch": "test/text-05-weight-prefetch",
   "base": "v0.30.0rc2",
-  "added_feature": "weight_prefetch",
+  "added_feature": "megamoe",
   "features": [
     "nz",
     "fusion",
     "gdn_fla",
     "shared_overlap",
-    "weight_prefetch"
+    "weight_prefetch",
+    "megamoe"
   ],
   "hardware": "Ascend A2",
   "tensor_parallel_size": 2,
@@ -23,7 +24,7 @@
     "weight_nz_mode": 2,
     "enable_flashcomm1": false,
     "multistream_overlap_shared_expert": true,
-    "enable_fused_mc2": 0,
+    "enable_fused_mc2": 2,
     "enable_fla_gdn": true,
     "fla_chunk_size": 128,
     "qwen35_weight_prefetch": {
@@ -37,6 +38,19 @@
       "next_input_bytes": 2097152,
       "gdn_out_bytes": 2097152,
       "min_decode_concurrency": 8
+    },
+    "allow_megamoe_shared_expert_overlap": true,
+    "mega_moe_prefill_token_threshold": 64,
+    "mega_moe_max_tokens": 131072,
+    "qwen35_megamoe_decode_nz": {
+      "enabled": true,
+      "layers": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "max_cache_bytes": 4294967296
     }
   },
   "environment": {},
@@ -44,5 +58,13 @@
     "conv_shared_storage",
     "image_preprocess",
     "vit_fusion"
-  ]
+  ],
+  "adaptation": {
+    "parent_branch": "test/text-05-weight-prefetch",
+    "decode_nz_cached_layers": 4,
+    "total_layers": 40,
+    "extra_cache_bytes_per_rank": 3221225472,
+    "npu_validated": false
+  },
+  "prefetch_version": 2
 }
