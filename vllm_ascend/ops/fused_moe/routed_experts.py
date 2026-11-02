@@ -788,6 +788,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if self.return_with_event:
             return routed_out, RoutedMoEMilestones(
                 routed_dispatch_start=fused_experts_results.before_dispatch_evt,
+                routed_fused_start=fused_experts_results.fused_moe_start_evt,
                 routed_mlp_start=fused_experts_results.before_moe_up_evt,
                 routed_activation_start=fused_experts_results.before_swiglu_evt,
                 routed_gmm2_start=fused_experts_results.before_gmm2_evt,

@@ -54,6 +54,8 @@ class RoutedMoEMilestones:
     routed_gmm2_start: torch.npu.Event | None = None
     routed_combine_start: torch.npu.Event | None = None
     routed_finalize_done: torch.npu.Event | None = None
+    # The fused operator exposes its enqueue boundary, never internal stages.
+    routed_fused_start: torch.npu.Event | None = None
 
     @property
     def has_fine_grained_stage_events(self) -> bool:

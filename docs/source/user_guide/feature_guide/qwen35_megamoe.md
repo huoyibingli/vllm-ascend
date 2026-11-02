@@ -29,3 +29,25 @@ EP disabled and therefore uses a different topology.
 Validation: added selection boundary and topology regression tests plus the
 updated A2 capability expectation. Full UT and NPU service validation require
 the matching vLLM, torch_npu, CANN, and MegaMoe extension environment.
+
+
+## Shared-expert overlap comparison branch
+
+`test/shared-overlap-megamoe` starts from `test/00-baseline` and combines
+the four-phase shared-expert overlap port with A2 prefill MegaMoe. Enable
+`multistream_overlap_shared_expert`, `allow_megamoe_shared_expert_overlap`,
+and `enable_fused_mc2=2` together. The guard requires A2, EP, DP1/PP1,
+and an unquantized supported model without LoRA or speculative decoding.
+
+Pure prefill above the threshold uses MegaMoe. Decode retains ordinary GMM
+and the four-phase shared-expert schedule. The fused path publishes only
+its real enqueue boundary; it does not expose internal GMM stage events.
+
+Run `bash benchmarks/qwen35_incremental/serve_shared_overlap_megamoe.sh`
+with `MODEL_PATH`, `LOG_ROOT`, and optionally `ASCEND_RT_VISIBLE_DEVICES`
+set for the machine. The script uses TP2/EP2, BF16, max length 32768,
+and the default GDN path. No extra NZ mode, fusion, FLA override, prefetch,
+or decode NZ cache is enabled. MegaMoe's existing BF16 loader keeps
+per-expert ND weights for both its fused path and ordinary GMM fallback;
+this branch does not implement shared BF16 NZ storage. Hardware accuracy
+and performance validation are still required.

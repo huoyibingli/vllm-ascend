@@ -29,7 +29,12 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import (
+    DeviceAdaptorFamily,
+    HardwareCapability,
+    MoECommPolicy,
+    get_current_hardware_profile,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -577,6 +582,8 @@ class AscendConfig:
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
+    # Opt-in A2 phase-aware composition; the default mutex remains unchanged.
+    allow_megamoe_shared_expert_overlap: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
@@ -843,7 +850,16 @@ class AscendConfig:
             "MiniMax M3 does not support enable_fused_mc2=1 (dispatch_ffn_combine). "
             "Set additional_config.enable_fused_mc2 to 2 to enable MegaMoe, or 0 to disable fused MC2."
         )
-        if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
+        if self.allow_megamoe_shared_expert_overlap:
+            if not self._supports_megamoe_shared_expert_overlap(vc):
+                raise ValueError(
+                    "allow_megamoe_shared_expert_overlap requires A2 MegaMoe, shared overlap, "
+                    "EP, DP1/PP1, and no quantization, LoRA or speculative decoding"
+                )
+            logger.info_once(
+                "A2 MegaMoe/shared-expert overlap composition enabled; scheduling follows runtime milestones"
+            )
+        elif self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
             self.multistream_overlap_shared_expert = False
             logger.warning_once(
                 "enable_fused_mc2 and multistream_overlap_shared_expert "
@@ -1051,6 +1067,24 @@ class AscendConfig:
         if self.mix_placement:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
+
+    def _supports_megamoe_shared_expert_overlap(self, vllm_config: VllmConfig) -> bool:
+        profile = get_current_hardware_profile()
+        parallel = vllm_config.parallel_config
+        return (
+            self.enable_fused_mc2 == 1
+            and self.multistream_overlap_shared_expert
+            and is_mega_moe_supported()
+            and profile.supports(HardwareCapability.CANN_MEGAMOE)
+            and profile.moe_comm_policy is MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY
+            and parallel.enable_expert_parallel
+            and parallel.data_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and vllm_config.quant_config is None
+            and vllm_config.lora_config is None
+            and vllm_config.speculative_config is None
+            and self._is_megamoe_supported_by_config(vllm_config)
+        )
 
     @staticmethod
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:

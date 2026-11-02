@@ -664,6 +664,8 @@ class AscendSharedExperts:
         submitted_gate_up: SubmittedSharedExpertGateUp,
         milestones: RoutedMoEMilestones,
     ) -> torch.Tensor:
+        if milestones.routed_fused_start is not None:
+            self._wait_for_milestone(milestones.routed_fused_start, "routed_fused_start")
         if submitted_gate_up.path is SharedExpertMLPPath.A8_INT_FUSED:
             return self._run_a8_int_mlp(submitted_gate_up, milestones)
         if submitted_gate_up.path is SharedExpertMLPPath.A8_MXFP_FUSED:
