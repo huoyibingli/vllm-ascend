@@ -30,7 +30,6 @@ Validation: added selection boundary and topology regression tests plus the
 updated A2 capability expectation. Full UT and NPU service validation require
 the matching vLLM, torch_npu, CANN, and MegaMoe extension environment.
 
-
 ## Shared-expert overlap comparison branch
 
 `test/shared-overlap-megamoe` starts from `test/00-baseline` and combines
@@ -51,7 +50,6 @@ or decode NZ cache is enabled. MegaMoe's existing BF16 loader keeps
 per-expert ND weights for both its fused path and ordinary GMM fallback;
 this branch does not implement shared BF16 NZ storage. Hardware accuracy
 and performance validation are still required.
-
 
 ## BF16 ND weight sharing experiment
 
@@ -89,3 +87,15 @@ normal CANN environment. Its results do not replace full-model accuracy
 and end-to-end performance validation. Compare the serving branches with
 the same input workload and keep the original five-round measurement
 policy. The previous four-scenario results do not measure this change.
+
+The 2026-11-02 paired serving run tested code commit `34d739b6f` against
+the original combined commit `2381e3ca9`. Both used five rounds of the same
+1024-input/1024-output random workload, 64 requests and concurrency 32;
+the final three rounds were averaged. Output throughput was 914.83 versus
+915.55 tokens/s (+0.08%), with throughput CVs of 0.43% and 0.50%.
+Mean TTFT was 1374.98 versus 1364.82 ms. This run did not establish a
+discernible throughput improvement, and the experimental branch is retained
+for isolating layout effects rather than claiming a resolved regression.
+The six native unit tests and the committed two-card exact-output test
+passed. Full `format.sh ci` dependency setup was blocked by Go proxy
+connection timeouts; relevant Ruff and syntax checks passed.
