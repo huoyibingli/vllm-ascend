@@ -2,8 +2,8 @@
 # shared_overlap_megamoe | native default GDN selection; no source patches
 set -euo pipefail
 REPO="${REPO:-/vllm-workspace/vllm-ascend}"
-MODEL_PATH="${MODEL_PATH:-/home/bzcai/weights}"
-LOG_ROOT="${LOG_ROOT:-/home/bzcai/mhd/perf}"
+MODEL_PATH="${MODEL_PATH:-/data/weights}"
+LOG_ROOT="${LOG_ROOT:-/data/perf}"
 mkdir -p "$LOG_ROOT/shared_overlap_megamoe/profile"
 unset BENCH_GDN_BACKEND BENCH_CASE_DIR
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
