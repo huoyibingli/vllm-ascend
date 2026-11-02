@@ -110,12 +110,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
         replace_parameter(layer, "w2_weight", w2_data)
 
-        # TODO: Current dispatch_ffn_combine/mega_moe fusion operator ONLY supports NZ format.
-        # Therefore, we must cast weights to NZ when fusion is enabled.
-        # Once the underlying dispatch_ffn_combine/mega_moe operator is updated to support
-        # ND format (or other formats), remove this specific 'if' check and the forced
-        # npu_format_cast. At that point, the operator should be able to handle weights
-        # in their native format without explicit casting here.
+        # dispatch_ffn_combine requires NZ, while A2 BF16 MegaMoe accepts
+        # per-expert ND tensors. Keep stacked ND parameters for ordinary GMM
+        # whenever the baseline also uses ND, and share their storage with
+        # MegaMoe through cached expert views. Dynamic EPLB keeps its existing
+        # independently allocated expert-list representation.
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2:
             use_megamoe = use_cann_megamoe(get_current_vllm_config())
@@ -131,6 +130,19 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     )
                     layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
                     layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+                elif (
+                    use_megamoe
+                    and not self.dynamic_eplb
+                    and get_ascend_config().weight_nz_mode == 1
+                    and layer.w13_weight.dtype == torch.bfloat16
+                    and layer.w2_weight.dtype == torch.bfloat16
+                ):
+                    layer.cann_mega_moe_w13_weight_list = list(layer.w13_weight.data.unbind(dim=0))
+                    layer.cann_mega_moe_w2_weight_list = list(layer.w2_weight.data.unbind(dim=0))
+                    logger.info_once(
+                        "MegaMoe shares BF16 ND storage: ordinary GMM keeps stacked weights; "
+                        "fused prefill uses cached expert views"
+                    )
                 else:
                     layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
                     layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
@@ -180,8 +192,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w2_weight_list = getattr(layer, "w2_weight_list", None)
         has_split_weight_lists = isinstance(w13_weight_list, list) and isinstance(w2_weight_list, list)
         if _EXTRA_CTX.use_mega_moe:
-            w1 = w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight]
-            w2 = w2_weight_list if isinstance(w2_weight_list, list) else [layer.w2_weight]
+            shared_w13 = getattr(layer, "cann_mega_moe_w13_weight_list", None)
+            shared_w2 = getattr(layer, "cann_mega_moe_w2_weight_list", None)
+            w1 = (
+                shared_w13
+                if shared_w13 is not None
+                else (w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight])
+            )
+            w2 = (
+                shared_w2
+                if shared_w2 is not None
+                else (w2_weight_list if isinstance(w2_weight_list, list) else [layer.w2_weight])
+            )
             w1_scale = None
             w2_scale = None
             w1_scale_bias = None

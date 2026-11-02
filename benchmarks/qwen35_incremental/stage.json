@@ -1,9 +1,9 @@
 {
   "stage": "shared-overlap-megamoe",
-  "branch": "test/shared-overlap-megamoe",
-  "previous_branch": "test/00-baseline",
+  "branch": "test/shared-overlap-megamoe-nd-shared",
+  "previous_branch": "test/shared-overlap-megamoe",
   "base": "v0.30.0rc2",
-  "added_feature": "shared_overlap+megamoe",
+  "added_feature": "preserve_stacked_nd_gmm_weights",
   "features": [
     "shared_overlap",
     "megamoe"

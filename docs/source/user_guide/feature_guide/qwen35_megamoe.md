@@ -51,3 +51,41 @@ or decode NZ cache is enabled. MegaMoe's existing BF16 loader keeps
 per-expert ND weights for both its fused path and ordinary GMM fallback;
 this branch does not implement shared BF16 NZ storage. Hardware accuracy
 and performance validation are still required.
+
+
+## BF16 ND weight sharing experiment
+
+`test/shared-overlap-megamoe-nd-shared` isolates the ordinary GMM weight
+representation from the prefill backend. For BF16, `weight_nz_mode=1`,
+non-MXFP MegaMoe, and static expert placement, ordinary GMM retains the
+contiguous three-dimensional ND parameters. MegaMoe receives cached
+per-expert two-dimensional views of the same storage. The views are created
+once during weight processing, including their expert offsets. They do not
+allocate another full set of weights or pack weights during decode.
+
+The original `test/shared-overlap-megamoe` branch remains the comparison
+control. Use the same `serve_shared_overlap_megamoe.sh` launcher and model
+settings for both branches; this experiment adds no serving option. Dynamic
+EPLB, other dtypes, mode 2 and the A5 unquantized fallback retain their
+existing behavior. The change does not add BF16 NZ input support to MegaMoe
+and does not change its phase selection or shared-expert synchronization.
+
+CPU contract tests cover storage aliases, stable cached views, in-place
+updates, loader metadata, GMM arguments and the excluded layouts. The
+two-card test compares stacked ND and independent-list GMM results, and
+MegaMoe views against cloned expert tensors, using the Qwen3.5 expert shapes.
+It covers 32/65/512 tokens, all expert offsets and inactive mask entries.
+
+Run the hardware check with two idle A2 devices assigned by the caller:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc-per-node=2 \
+  tests/e2e/pull_request/two_card/test_megamoe_nd_weight_sharing_two_card.py \
+  --output-dir /tmp/megamoe-nd-views
+```
+
+The standalone check requires the installed CANN MegaMoe extension and the
+normal CANN environment. Its results do not replace full-model accuracy
+and end-to-end performance validation. Compare the serving branches with
+the same input workload and keep the original five-round measurement
+policy. The previous four-scenario results do not measure this change.
