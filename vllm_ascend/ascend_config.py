@@ -591,6 +591,11 @@ class AscendConfig:
     # model's quant_type, 0 means disabled (use the model's own quant).
     combine_quant_mode: Literal[0, 2, 3, 4] = 0
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
+    # Fuse eligible prefill batches only above this global token count.
+    mega_moe_prefill_token_threshold: int = 64
+    # Opt in to eager mixed-prefill batches; decode-only graphs keep their
+    # existing backend. Uses the same token threshold and fused capacity.
+    mega_moe_allow_mixed_prefill: bool = False
     # Per-rank token capacity after dispatch in the fused MC2/MegaMoe path.
     # The same value is passed as dispatch_ffn_combine's max_output_size
     # and CANN MegaMoe buffer's max_recv_token_num.
@@ -598,7 +603,6 @@ class AscendConfig:
     # count exceeds it, tokens may be truncated, causing precision
     # degradation. Do not set it too large because workspace memory scales
     # linearly with this value. Default 65536.
-    mega_moe_prefill_token_threshold: int = 64
     mega_moe_max_tokens: int = 65536
     ascend_log_path: str = dataclasses.field(
         default_factory=lambda: os.path.join(os.path.expanduser("~"), "ascend", "log", "vllm_ascend")

@@ -167,6 +167,7 @@ def set_ascend_forward_context(
             draft_moe_quant_type=draft_moe_quant_type,
             attn_metadata=attn_metadata,
             in_profile_run=in_profile_run,
+            is_graph_mode=aclgraph_runtime_mode != CUDAGraphMode.NONE,
         )
 
         forward_context.moe_comm_type = moe_comm_type
@@ -315,6 +316,7 @@ def _select_capacity_and_expert_density_moe_comm_method(
     draft_moe_quant_type: QuantType = QuantType.NONE,
     attn_metadata: Any = None,
     in_profile_run: bool = False,
+    is_graph_mode: bool = False,
 ) -> MoECommType:
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = (
@@ -325,24 +327,54 @@ def _select_capacity_and_expert_density_moe_comm_method(
     metadata = attn_metadata.values() if isinstance(attn_metadata, dict) else (attn_metadata,)
     phases = [(getattr(meta, "num_prefills", 0), getattr(meta, "num_decode_tokens", None)) for meta in metadata]
     is_pure_prefill = bool(phases) and all(prefills > 0 and decodes == 0 for prefills, decodes in phases)
+    has_prefill = any(prefills > 0 for prefills, _ in phases)
     ascend_config = get_ascend_config()
+    parallel = vllm_config.parallel_config
+    mixed_prefill_allowed = (
+        getattr(ascend_config, "mega_moe_allow_mixed_prefill", False)
+        and has_prefill
+        and getattr(vllm_config.model_config, "dtype", None) == torch.bfloat16
+        and not getattr(vllm_config.model_config, "is_quantized", False)
+        and getattr(vllm_config, "quant_config", None) is None
+        and parallel.pipeline_parallel_size == 1
+        and getattr(parallel, "prefill_context_parallel_size", 1) == 1
+        and getattr(parallel, "decode_context_parallel_size", 1) == 1
+        and not getattr(parallel, "use_sequence_parallel_moe", False)
+        and not getattr(parallel, "enable_eplb", False)
+        and not getattr(getattr(ascend_config, "eplb_config", None), "dynamic_eplb", False)
+    )
+    phase_allowed = is_pure_prefill or mixed_prefill_allowed
+    within_capacity = (
+        mc2_tokens_capacity is not None
+        and mc2_tokens_capacity > 0
+        and (
+            (num_tokens is None and in_profile_run)
+            or (num_tokens is not None and 0 < num_tokens <= mc2_tokens_capacity)
+        )
+    )
     # Local phase counts cannot select a collective shared across DP ranks:
     # another rank may be decoding. Keep the new phase-aware route on DP=1.
     if (
-        use_cann_megamoe(vllm_config)
+        not is_graph_mode
+        and within_capacity
+        and (phase_allowed or in_profile_run)
+        and use_cann_megamoe(vllm_config)
         and getattr(vllm_config.parallel_config, "data_parallel_size", 1) == 1
         and not is_draft_model
         and getattr(vllm_config, "speculative_config", None) is None
-        and (is_pure_prefill or in_profile_run)
         and (in_profile_run or (num_tokens is not None and num_tokens > ascend_config.mega_moe_prefill_token_threshold))
     ):
+        representative = next(((prefills, decodes) for prefills, decodes in phases if prefills > 0), (0, None))
+        has_decode = any(decodes is not None and decodes > 0 for _, decodes in phases)
+        batch_kind = "profile" if in_profile_run else ("mixed_prefill_decode" if has_decode else "prefill")
         logger.info_once(
             "A2 MegaMoe fused prefill selected (num_tokens=%s, num_prefills=%s, "
-            "num_decode_tokens=%s, in_profile_run=%s)",
+            "num_decode_tokens=%s, in_profile_run=%s, batch_kind=%s)",
             num_tokens,
-            phases[0][0] if phases else 0,
-            phases[0][1] if phases else 0,
+            representative[0],
+            representative[1],
             in_profile_run,
+            batch_kind,
         )
         return MoECommType.FUSED_MC2
 
@@ -365,6 +397,7 @@ def _select_fused_or_capacity_moe_comm_method(
     draft_moe_quant_type: QuantType = QuantType.NONE,
     attn_metadata: Any = None,
     in_profile_run: bool = False,
+    is_graph_mode: bool = False,
 ) -> MoECommType:
     if use_cann_megamoe(vllm_config):
         return MoECommType.FUSED_MC2
@@ -385,6 +418,7 @@ def _select_capacity_and_world_size_moe_comm_method(
     draft_moe_quant_type: QuantType = QuantType.NONE,
     attn_metadata: Any = None,
     in_profile_run: bool = False,
+    is_graph_mode: bool = False,
 ) -> MoECommType:
     if get_ascend_config().enable_fused_mc2 == 1:
         if is_mega_moe_supported():
@@ -423,6 +457,7 @@ def select_moe_comm_method(
     draft_moe_quant_type: QuantType = QuantType.NONE,
     attn_metadata: Any = None,
     in_profile_run: bool = False,
+    is_graph_mode: bool = False,
 ) -> MoECommType | None:
     """Select the MoE communication method from the active hardware policy,
     parallel settings, and token count.
@@ -433,6 +468,8 @@ def select_moe_comm_method(
         is_draft_model (bool): Whether the model runs in MTP mode.
         draft_moe_quant_type (QuantType): The draft model's MoE quantization
             type, used on A5 to decide whether the draft can use mega moe.
+        is_graph_mode (bool): Exclude A2 prefill fusion during graph capture
+            or replay; eager mixed prefill is separately opt-in.
     Returns:
         MoECommType | None: The selected MoE communication method.
     """
@@ -461,6 +498,7 @@ def select_moe_comm_method(
             draft_moe_quant_type,
             attn_metadata,
             in_profile_run,
+            is_graph_mode,
         )
     logger.debug(
         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "

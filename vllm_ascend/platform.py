@@ -638,6 +638,7 @@ class NPUPlatform(Platform):
             vllm_config,
             attn_metadata=attn_metadata,
             in_profile_run=in_profile_run,
+            is_graph_mode=cudagraph_runtime_mode != CUDAGraphMode.NONE,
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
 
