@@ -1593,3 +1593,31 @@ def test_host_conv_indices_are_shared_and_refreshed(monkeypatch):
     refreshed = builder.build(0, common).non_spec_prefill_metadata.causal_conv1d.cache_indices
     assert refreshed.data_ptr() == indices.data_ptr()
     assert indices.tolist() == [40, 50]
+
+
+@pytest.mark.parametrize("chunk_size", [64, 128])
+@pytest.mark.parametrize("build_device_metadata", [False, True])
+def test_fla_chunk_indices_preserve_chunk64_fallback(chunk_size, build_device_metadata):
+    config = _make_vllm_config(num_heads=6)
+    config.additional_config = {"fla_gdn_chunk_size": chunk_size}
+    builder = SimpleNamespace(vllm_config=config)
+    cu = torch.tensor([0, 0, 65, 65, 194], dtype=torch.int32)
+    meta = ascend_gdn_attn_builder._build_non_spec_chunked_prefill_metadata(
+        builder, cu, torch.device("cpu"), build_device_metadata=build_device_metadata
+    )
+
+    chunk64 = (0, 0, 0, 1, 1, 0, 1, 1, 1, 2)
+    chunk128 = (0, 0, 1, 0, 1, 1)
+    assert meta.fla_chunk_size == chunk_size
+    assert meta.fla_chunk_indices_host == (chunk64 if chunk_size == 64 else chunk128)
+    assert meta.chunk_indices_chunk64_host == chunk64
+    if chunk_size == 64:
+        assert meta.fla_chunk_indices_host is meta.chunk_indices_chunk64_host
+    assert meta.cu_seqlens_kern == (0, 65, 194)
+    assert meta.keep_meta.tolist() == [False, True, False, True]
+    if build_device_metadata:
+        assert tuple(meta.chunk_indices_chunk64.flatten().tolist()) == chunk64
+        assert meta.chunk_offsets_chunk64.tolist() == [0, 0, 2, 2, 5]
+    else:
+        assert meta.chunk_indices_chunk64 is None
+        assert meta.chunk_offsets_chunk64 is None

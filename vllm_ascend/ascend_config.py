@@ -428,6 +428,7 @@ class AscendConfig:
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
             "enable_prefill_mc2": false,
+            "fla_gdn_chunk_size": 64,
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
             "kv_pool_range_debug": false,
@@ -577,6 +578,9 @@ class AscendConfig:
         )
     )
     enable_prefill_mc2: bool = False
+    # Only the external FLA GDN prefill path consumes this size.
+    # The Triton/CANN fallback paths retain their own chunking contracts.
+    fla_gdn_chunk_size: Literal[64, 128] = 64
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     kv_pool_range_debug: bool = False
@@ -661,6 +665,12 @@ class AscendConfig:
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.fla_gdn_chunk_size == 128:
+            profile = get_current_hardware_profile()
+            if profile.device_adaptor_family != DeviceAdaptorFamily.STANDARD or not profile.supports(
+                HardwareCapability.FLA_GDN_PREFILL
+            ):
+                raise ValueError("fla_gdn_chunk_size=128 is only supported by the A2/A3 FLA GDN prefill path.")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.

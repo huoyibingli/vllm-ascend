@@ -891,7 +891,7 @@ class BaseDeviceAdaptor:
         prebuilt_meta,
         fused_fwd,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the A2/A3 Phase6 FLA NPU GDN prefill kernel."""
+        """Run the A2/A3 FLA NPU GDN prefill path with matching host metadata."""
         # FLA's import-time capability queries can initialize an NPU context;
         # defer them until execution on the selected worker device.
         # TODO: Restore the top-level import once supported vLLM FLA or Triton
@@ -912,7 +912,11 @@ class BaseDeviceAdaptor:
         v = v.transpose(1, 2).contiguous()
 
         cu_seqlens = prebuilt_meta.cu_seqlens_host
-        chunk_indices = prebuilt_meta.chunk_indices_chunk64_host
+        chunk_indices = prebuilt_meta.fla_chunk_indices_host
+        if chunk_indices is None:
+            # Older callers may only supply the default chunk64 descriptors.
+            assert prebuilt_meta.fla_chunk_size == 64
+            chunk_indices = prebuilt_meta.chunk_indices_chunk64_host
         keep_meta = prebuilt_meta.keep_meta
         # stateVFirst=false takes [N, Hv, K, V], i.e. the transpose of ssm_state.
         initial_state_kern = initial_state.transpose(-1, -2).contiguous()
@@ -928,7 +932,7 @@ class BaseDeviceAdaptor:
             beta,
             initial_state=initial_state_kern,
             output_final_state=True,
-            chunk_size=64,
+            chunk_size=prebuilt_meta.fla_chunk_size,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             scale=scale,
