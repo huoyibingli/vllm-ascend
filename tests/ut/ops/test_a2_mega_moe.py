@@ -343,16 +343,23 @@ def test_real_a2_buffer_uses_physical_width_and_safe_route_capacity():
     assert kwargs["intermediate_hidden"] == 768
 
 
-def test_real_config_requires_explicit_cann_backend_and_package():
+@pytest.mark.parametrize("fla_chunk_size", [64, 128])
+def test_real_config_requires_explicit_cann_backend_and_package(fla_chunk_size):
     source = ast.parse((ROOT / "vllm_ascend/ascend_config.py").read_text())
     owner = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "AscendConfig")
     method = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "_validate_user_input_ranges")
     method.decorator_list = []
     package = SimpleNamespace(util=SimpleNamespace(find_spec=Mock(return_value=object())))
-    namespace = dict(importlib=package)
+    namespace = dict(
+        importlib=package,
+        DeviceAdaptorFamily=SimpleNamespace(STANDARD="standard"),
+        HardwareCapability=SimpleNamespace(FLA_GDN_PREFILL="fla"),
+        get_current_hardware_profile=lambda: SimpleNamespace(device_adaptor_family="standard", supports=lambda _: True),
+    )
     exec(compile(ast.Module(body=[method], type_ignores=[]), "ascend_config.py", "exec"), namespace)
     validate = namespace[method.name]
     cfg = SimpleNamespace(
+        fla_gdn_chunk_size=fla_chunk_size,
         weight_nz_mode=1,
         enable_mc2_hierarchy_comm=False,
         enable_fused_mc2=2,

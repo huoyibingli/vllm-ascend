@@ -51,6 +51,27 @@ per-expert NZ lists feed MegaMoE. Ordinary mixed/decode execution keeps its
 stacked NZ weights and FP32 first-layer scale copy; no per-forward repacking is
 introduced. Both paths use the same physical width and INT8 weight storage.
 
+## Combine with FLA GDN chunk128
+
+On 910B, both prefill features can be enabled in one configuration:
+
+```shell
+--additional-config '{"enable_fused_mc2":2,"a2_mega_moe_prefill":{"enabled":true},"fla_gdn_chunk_size":128}'
+```
+
+Keep BF16 activations and PCP1. GDN chunk128 applies only when the installed
+external FLA prefill backend is actually selected; it does not force that
+backend. MegaMoE still applies only to confirmed pure-prefill eager forwards.
+In mixed batches, GDN's prefill subset may use chunk128 while the whole MoE
+batch retains the ordinary backend. Neither feature changes the other's chunk
+size, scheduler token budget or phase selection.
+
+Compare baseline, MegaMoE-only, FLA128-only and combined runs with the same
+checkpoint and workload. Check attention output and recurrent state as well as
+MoE output, complete-model precision, peak workspace, TTFT and TPOT. The two
+features can require additional memory and their speedups are not additive.
+See [FLA chunk configuration](../configuration/additional_config.md#fla-gdn-prefill-chunk-size).
+
 ## Selection
 
 | Forward | Routed MoE backend |

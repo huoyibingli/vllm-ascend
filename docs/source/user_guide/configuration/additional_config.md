@@ -48,6 +48,7 @@ The following table lists additional configuration options available in vLLM Asc
 
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
+| `fla_gdn_chunk_size` | int | `64` | Chunk size of the external FLA GDN prefill operator on A2/A3: `64` or `128`. Other platforms only support the default `64`. Does not change CANN/Triton fallback or PCP chunking. |
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
@@ -386,3 +387,27 @@ KVPP supports non-hybrid MLA/SFA models with eager execution or `PIECEWISE` grap
 KVPP can be combined with `MooncakeConnectorV2` for P/D disaggregation and `AscendStoreConnector` for KV pooling under the connector-specific restrictions in the [KVPP guide](../feature_guide/kvpp.md#kv-transfer-configuration). Enable KVPP only on the prefill node for P/D disaggregation. `MultiConnector` can combine these connectors; each child must satisfy its own type and role requirements.
 
 PCP gathers prefill KV before cache writes. KVPP layer broadcasts restore prior-forward cache contents before attention; the broadcast decision uses the global scheduled batch rather than PCP-local segment offsets.
+
+## FLA GDN prefill chunk size
+
+On Ascend 910B/910C, select the external FLA GDN prefill chunk size at startup:
+
+```bash
+vllm serve /path/to/Qwen3.8-Flash-Next \
+    --tensor-parallel-size 8 \
+    --additional-config '{"fla_gdn_chunk_size": 128}'
+```
+
+The default is `64`. This option only applies when the external FLA prefill
+backend is selected (BF16 with prefill context parallel size 1 and an available
+FLA operator). It does not force that backend: CANN/Triton fallback, PCP, decode
+and speculative recurrent attention retain their existing behavior.
+
+The 128-token option uses the A2/A3 legacy fused path with external Q/K L2Norm.
+For the common BF16, K=V=128 shapes, the 64-token option can use the FLA
+Prepare/H/O path. Benchmark both choices on the deployed FLA version and
+workload; a larger chunk does not guarantee lower latency and can require more
+workspace. Validate both attention outputs and final recurrent states.
+
+`fla_gdn_chunk_size=128` is rejected on A5 and 310P. The option does not change
+the scheduler's chunked-prefill budget or the KV-cache block size.

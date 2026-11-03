@@ -130,6 +130,9 @@ class GDNChunkedPrefillMetadata:
     num_decodes: int = 0
     cu_seqlens_kern: tuple[int, ...] | None = None
     keep_meta: torch.Tensor | None = None
+    # Separate FLA descriptors keep the fallback/PCP chunk64 contract intact.
+    fla_chunk_size: int = _GDN_CHUNK_SIZE
+    fla_chunk_indices_host: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -304,6 +307,16 @@ def _build_non_spec_chunked_prefill_metadata(
         )
         block_indices_cumsum = prepare_chunk_indices(cu_seqlens_cpu, cumsum_chunk_size)
 
+    chunk_indices_chunk64_host = tuple(chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist())
+    # AscendConfig validates this additional-config field before builders run.
+    additional_config = getattr(builder.vllm_config, "additional_config", None) or {}
+    fla_chunk_size = int(additional_config.get("fla_gdn_chunk_size", _GDN_CHUNK_SIZE))
+    fla_chunk_indices_host = chunk_indices_chunk64_host
+    if fla_chunk_size != _GDN_CHUNK_SIZE:
+        fla_chunk_indices_host = tuple(
+            prepare_chunk_indices(cu_seqlens_cpu, fla_chunk_size).to(torch.int64).reshape(-1).tolist()
+        )
+
     cu_seqlens_host = tuple(cu_seqlens_cpu.to(torch.int64).reshape(-1).tolist())
     # Pre-compute compact cu_seqlens for AscendC kernels so each layer
     # can reuse them instead of calling _compact_empty_segments again.
@@ -334,7 +347,9 @@ def _build_non_spec_chunked_prefill_metadata(
 
     return GDNChunkedPrefillMetadata(
         cu_seqlens_host=cu_seqlens_host,
-        chunk_indices_chunk64_host=tuple(chunk_indices_chunk64.to(torch.int64).reshape(-1).tolist()),
+        chunk_indices_chunk64_host=chunk_indices_chunk64_host,
+        fla_chunk_size=fla_chunk_size,
+        fla_chunk_indices_host=fla_chunk_indices_host,
         **device_chunk_metadata,
         cu_seqlens_kern=cu_seqlens_kern,
         keep_meta=keep_meta,

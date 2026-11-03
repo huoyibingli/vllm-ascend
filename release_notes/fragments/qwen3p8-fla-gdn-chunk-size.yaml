@@ -1,0 +1,6 @@
+# Replace the placeholder with the PR number when submitting this branch.
+pr: null
+entries:
+  - category: config
+    text: Added fla_gdn_chunk_size to additional_config, allowing 64- or 128-token chunks for the external FLA GDN prefill path on A2/A3 while preserving fallback chunking.
+    hardware: [A2, A3]
