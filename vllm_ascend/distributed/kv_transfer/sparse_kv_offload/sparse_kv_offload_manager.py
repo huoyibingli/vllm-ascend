@@ -5,7 +5,6 @@ from zlib import adler32
 import numpy as np
 import torch
 import torch_npu
-
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -26,6 +25,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
+
 
 def _get_memfabric_offload():
     # MemFabric's native library can interpose the symbols of ZercMoE's SHMEM.
@@ -683,11 +683,15 @@ class SparseKVOffloadManager:
         owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
         membership_map = None
         if self.tp_rank == 0:
-            membership_map = _get_memfabric_offload().empty(
-                [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
-                dtype=torch.int16,
-                pin_memory=True,
-            ).view(shape)
+            membership_map = (
+                _get_memfabric_offload()
+                .empty(
+                    [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
+                    dtype=torch.int16,
+                    pin_memory=True,
+                )
+                .view(shape)
+            )
             membership_map.fill_(-1)
             control = membership_map[
                 :,

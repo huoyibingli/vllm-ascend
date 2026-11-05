@@ -182,9 +182,8 @@ def use_cann_zercmoe(vllm_config: VllmConfig) -> bool:
 
     from vllm_ascend.ops.fused_moe.zercmoe import zercmoe_available
 
-    return (
-        get_ep_group().world_size == vllm_config.parallel_config.tensor_parallel_size
-        and zercmoe_available(vllm_config.model_config.is_quantized)
+    return get_ep_group().world_size == vllm_config.parallel_config.tensor_parallel_size and zercmoe_available(
+        vllm_config.model_config.is_quantized
     )
 
 
