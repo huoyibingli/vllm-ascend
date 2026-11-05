@@ -252,6 +252,7 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
     get_mc2_tokens_capacity,
+    get_zercmoe_tokens_capacity,
     select_moe_comm_method,
     set_ascend_forward_context,
     set_mc2_mask,
@@ -2680,6 +2681,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 device_metadata_executor=active_device_metadata_executor,
                 skip_compiled=has_encoder_input,
+                with_prefill=self.with_prefill,
                 has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ),
@@ -4569,7 +4571,8 @@ class NPUModelRunner(GPUModelRunner):
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
                 device_metadata_executor=active_device_metadata_executor,
-                has_sinks = self._has_sinks,
+                with_prefill=with_prefill,
+                has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
                 if not is_graph_capturing and self.ascend_config.enable_force_eplb \
@@ -4656,6 +4659,17 @@ class NPUModelRunner(GPUModelRunner):
                 self._dummy_run(
                     mc2_tokens_capacity, with_prefill=True, is_profile=True, randomize_inputs=randomize_inputs
                 )
+        if getattr(self.ascend_config, "enable_zerc_moe", 0) == 1:
+            zercmoe_capacity = get_zercmoe_tokens_capacity(self.vllm_config)
+            if (
+                self.max_num_tokens > zercmoe_capacity
+                and select_moe_comm_method(zercmoe_capacity, self.vllm_config, zercmoe_prefill=True)
+                == MoECommType.ZERC_MOE
+            ):
+                with disable_compilation(self.get_model()):
+                    self._dummy_run(
+                        zercmoe_capacity, with_prefill=True, is_profile=True, randomize_inputs=randomize_inputs
+                    )
         super().profile_run(randomize_inputs=randomize_inputs)
 
     def eplb_warmup(self):

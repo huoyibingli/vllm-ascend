@@ -29,6 +29,9 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Opt into ZercMoE on A2. Valid values are 0 (default) and 1. Not sensitive.
+    # Explicit additional_config.enable_zerc_moe takes precedence.
+    "VLLM_ASCEND_ENABLE_ZERC_MOE": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_ZERC_MOE", "0")),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

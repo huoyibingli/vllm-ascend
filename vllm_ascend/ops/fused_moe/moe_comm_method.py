@@ -15,16 +15,24 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import cast
 
 import torch
+from vllm.config import get_current_vllm_config
+from vllm.distributed import get_ep_group
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    MoECommType,
+    get_zercmoe_tokens_capacity,
+    use_cann_zercmoe,
+)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe import moe_utils
@@ -45,7 +53,10 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithAllGather,
     TokenDispatcherWithMC2,
 )
+from vllm_ascend.ops.fused_moe.zercmoe import load_zercmoe, pack_bf16_zercmoe_weights, run_zercmoe
 from vllm_ascend.quantization.quant_type import QuantType
+
+_ZERCMOE_DEFAULT_IPPORT = "tcp://127.0.0.1:28765"
 
 _MoECommMethods: dict[tuple[MoECommType | None, tuple[int, ...]], MoECommMethod] = {}
 
@@ -55,6 +66,8 @@ def _moe_config_key(
 ) -> tuple[MoECommType | None, tuple[int, ...]]:
     """Return the execution shape that owns mutable MoE comm state."""
     _CONFIG_KEY_FIELDS = ("num_experts", "num_local_experts")
+    if moe_comm_type == MoECommType.ZERC_MOE:
+        _CONFIG_KEY_FIELDS += ("experts_per_token", "hidden_dim", "intermediate_size_per_partition")
     return (moe_comm_type, tuple(int(getattr(moe_config, field, 0) or 0) for field in _CONFIG_KEY_FIELDS))
 
 
@@ -71,6 +84,12 @@ def setup_moe_comm_method(moe_config):
         _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, moe_config)] = AllGatherCommImpl(moe_config)
         _MoECommMethods[_moe_config_key(MoECommType.MC2, moe_config)] = MC2CommImpl(moe_config)
         _MoECommMethods[_moe_config_key(MoECommType.FUSED_MC2, moe_config)] = FusedMC2CommImpl(moe_config)
+        if getattr(get_ascend_config(), "enable_zerc_moe", 0) == 1:
+            vllm_config = get_current_vllm_config()
+            if use_cann_zercmoe(vllm_config):
+                key = _moe_config_key(MoECommType.ZERC_MOE, moe_config)
+                capacity = get_zercmoe_tokens_capacity(vllm_config) // moe_config.ep_size
+                _MoECommMethods[key] = ZercMoECommImpl(moe_config, capacity)
     else:
         _MoECommMethods[_moe_config_key(MoECommType.ALLGATHER, moe_config)] = AllGatherCommImpl(moe_config)
 
@@ -611,5 +630,76 @@ class FusedMC2CommImpl(MoECommMethod):
             raise ValueError(f"Wrong value of {self.enable_fused_mc2=}")
         return FusedExpertsResult(
             routed_out=out,
+            expert_tokens=expert_tokens,
+        )
+
+
+class ZercMoECommImpl(MC2CommImpl):
+    """Reuse MC2 token sharding/gathering around the SHMEM fused operator."""
+
+    shared_activation_overlaps_routed_gmm1 = False
+
+    def __init__(self, moe_config, max_tokens_per_rank: int):
+        super().__init__(moe_config)
+        self.max_tokens_per_rank = max_tokens_per_rank
+        self.zerc_symm_buffer = None
+        self.bf16_scratch = None
+
+    def _init_zerc_symm_buffer(self):
+        config = get_ascend_config()
+        ep_group = get_ep_group()
+        ipport = config.zercmoe_ipport or _ZERCMOE_DEFAULT_IPPORT
+        logger.info(
+            "ZercMoE SHMEM bootstrap: rank=%d, world_size=%d, max_tokens_per_rank=%d, address=%s",
+            ep_group.rank_in_group,
+            ep_group.world_size,
+            self.max_tokens_per_rank,
+            ipport,
+        )
+        # The wheel bootstraps from launcher variables. In this topology,
+        # the global rank and EP rank are identical.
+        os.environ["RANK"] = str(ep_group.rank_in_group)
+        os.environ["WORLD_SIZE"] = str(ep_group.world_size)
+        return load_zercmoe().get_symm_buffer(
+            moe_expert_num=self.moe_config.num_experts,
+            ep_world_size=ep_group.world_size,
+            num_max_tokens_per_rank=self.max_tokens_per_rank,
+            num_topk=self.moe_config.experts_per_token,
+            hidden=self.moe_config.hidden_dim,
+            intermediate_hidden=self.moe_config.intermediate_size_per_partition,
+            ipport=ipport,
+            device_id=torch.npu.current_device(),
+            mem_size_mb=config.zercmoe_shmem_mb or 0,
+        )
+
+    def fused_experts(self, fused_experts_input: MoEFusedExpertsInput, quant_method=None):
+        inputs = fused_experts_input
+        quant_type = inputs.quant.quant_type
+        activation = getattr(inputs.activation, "value", inputs.activation)
+        if (
+            quant_type not in (QuantType.NONE, QuantType.W8A8)
+            or activation != "silu"
+            or inputs.hidden_states.dtype != torch.bfloat16
+            or inputs.routing.apply_router_weight_on_input
+        ):
+            raise ValueError("ZercMoE requires BF16 activations, BF16 or W8A8 experts and standard SiLU")
+        if inputs.hidden_states.shape[0] > self.max_tokens_per_rank:
+            raise ValueError(f"ZercMoE input exceeds its per-rank capacity of {self.max_tokens_per_rank} tokens")
+
+        w8a8 = quant_type == QuantType.W8A8
+        if w8a8:
+            weights = inputs.layer.zercmoe_weights
+        else:
+            self.bf16_scratch = pack_bf16_zercmoe_weights(inputs.layer, self.bf16_scratch)
+            weights = self.bf16_scratch
+
+        if self.zerc_symm_buffer is None:
+            self.zerc_symm_buffer = self._init_zerc_symm_buffer()
+
+        before_dispatch_evt = maybe_record_event()
+        out, expert_tokens = run_zercmoe(inputs, weights, self.zerc_symm_buffer, w8a8=w8a8)
+        return FusedExpertsResult(
+            routed_out=out,
+            before_dispatch_evt=before_dispatch_evt,
             expert_tokens=expert_tokens,
         )

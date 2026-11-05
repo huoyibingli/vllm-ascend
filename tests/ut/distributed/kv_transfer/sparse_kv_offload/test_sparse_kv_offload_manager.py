@@ -320,9 +320,8 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                     ),
                     patch.object(
                         manager_module,
-                        "offload",
-                        offload_backend,
-                        create=True,
+                        "_get_memfabric_offload",
+                        return_value=offload_backend,
                     ),
                     patch.object(
                         manager_module.torch,
@@ -388,7 +387,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                 "get_sparse_kv_offload_cpu_pool_size_bytes",
                 return_value=(1 << 30) + 1,
             ),
-            patch.object(manager_module, "offload", offload_backend, create=True),
+            patch.object(manager_module, "_get_memfabric_offload", return_value=offload_backend),
             patch.object(manager_module.torch, "zeros", return_value=MagicMock()),
             patch.object(manager_module.torch, "empty", return_value=MagicMock()),
             patch.object(manager_module, "_sparse_kv_ops", return_value=MagicMock()),

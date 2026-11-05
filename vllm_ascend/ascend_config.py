@@ -31,6 +31,7 @@ from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
@@ -640,6 +641,10 @@ class AscendConfig:
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
+    enable_zerc_moe: Literal[0, 1] = dataclasses.field(default_factory=lambda: ascend_envs.VLLM_ASCEND_ENABLE_ZERC_MOE)
+    zercmoe_batch_mode: Literal["prefill", "prefill_and_mixed"] = "prefill"
+    zercmoe_ipport: str | None = None
+    zercmoe_shmem_mb: int | None = None
     # DeepSeek V4.1 FP8 x FP4 backend from DeepGEMM-Ascend (950, TP1/EP8).
     deepgemm_mega_moe: bool = False
     enable_mlapo: bool = True
@@ -688,6 +693,13 @@ class AscendConfig:
     _sparse_li_c4_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c4_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    @field_validator("zercmoe_shmem_mb", mode="before")
+    @classmethod
+    def _validate_zercmoe_shmem_mb(cls, value):
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError("zercmoe_shmem_mb must be a positive integer")
+        return value
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):

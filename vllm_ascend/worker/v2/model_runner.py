@@ -57,6 +57,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
     get_mc2_tokens_capacity,
+    get_zercmoe_tokens_capacity,
     override_mrv2_in_profile_run,
     select_moe_comm_method,
     set_mc2_mask,
@@ -862,6 +863,17 @@ class NPUModelRunner(GPUModelRunner):
                         is_profile=True,
                         **profile_kwargs,
                     )
+            if getattr(self.ascend_config, "enable_zerc_moe", 0) == 1:
+                zercmoe_capacity = get_zercmoe_tokens_capacity(self.vllm_config)
+                if (
+                    self.max_num_tokens > zercmoe_capacity
+                    and select_moe_comm_method(zercmoe_capacity, self.vllm_config, zercmoe_prefill=True)
+                    == MoECommType.ZERC_MOE
+                ):
+                    with disable_compilation(self.get_model()):
+                        self._dummy_run(
+                            zercmoe_capacity, skip_attn=True, skip_eplb=True, is_profile=True, **profile_kwargs
+                        )
             super().profile_run(**profile_kwargs)
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):

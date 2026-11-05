@@ -678,6 +678,7 @@ class NPUPlatform(Platform):
             get_mc2_mask,
             get_mrv2_in_profile_run,
             select_moe_comm_method,
+            should_try_zercmoe,
             sync_v2_extra_kwargs,
             use_cann_megamoe,
         )
@@ -743,6 +744,7 @@ class NPUPlatform(Platform):
         moe_comm_type = select_moe_comm_method(
             max_tokens_across_dp,
             vllm_config,
+            zercmoe_prefill=should_try_zercmoe(attn_metadata, cudagraph_runtime_mode, in_profile_run),
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
 
@@ -1289,6 +1291,8 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config: AscendConf
     from vllm.config import CompilationMode
     from vllm.config.compilation import CUDAGraphMode
 
+    from vllm_ascend.ascend_forward_context import is_zercmoe_supported_by_config
+
     compilation_config = vllm_config.compilation_config
     model_config = vllm_config.model_config
     additional_config = vllm_config.additional_config
@@ -1330,6 +1334,21 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config: AscendConf
             "Xlite graph enabled; falling back `compilation_config.cudagraph_mode` to %s (enforce_eager: %s)",
             compilation_config.cudagraph_mode,
             enforce_eager,
+        )
+
+    graph_mode = compilation_config.cudagraph_mode
+    if (
+        getattr(ascend_config, "enable_zerc_moe", 0) == 1
+        and not enforce_eager
+        and graph_mode is not None
+        and graph_mode.mixed_mode() != CUDAGraphMode.NONE
+        and is_zercmoe_supported_by_config(vllm_config)
+    ):
+        compilation_config.cudagraph_mode = (
+            CUDAGraphMode.FULL_DECODE_ONLY if graph_mode.decode_mode() == CUDAGraphMode.FULL else CUDAGraphMode.NONE
+        )
+        logger.info_once(
+            "ZercMoE uses eager prefill and mixed batches; graph mode is %s.", compilation_config.cudagraph_mode
         )
 
     if enforce_eager:

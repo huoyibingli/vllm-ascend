@@ -30,7 +30,12 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import Un
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, select_moe_comm_method, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    select_moe_comm_method,
+    use_cann_megamoe,
+    use_cann_zercmoe,
+)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -48,6 +53,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
 )
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
+from vllm_ascend.ops.fused_moe.zercmoe import validate_zercmoe_layer, zercmoe_available
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
@@ -119,8 +125,22 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # ND format (or other formats), remove this specific 'if' check and the forced
         # npu_format_cast. At that point, the operator should be able to handle weights
         # in their native format without explicit casting here.
-        enable_fused_mc2 = get_ascend_config().enable_fused_mc2
-        if enable_fused_mc2:
+        ascend_config = get_ascend_config()
+        enable_fused_mc2 = ascend_config.enable_fused_mc2
+        if getattr(ascend_config, "enable_zerc_moe", 0) == 1 and use_cann_zercmoe(get_current_vllm_config()):
+            if not zercmoe_available(False):
+                raise ValueError("ZercMoE BF16 operator is required for unquantized routed layers")
+            validate_zercmoe_layer(layer)
+            experts = self.moe.num_local_experts
+            hidden, intermediate = self.moe.hidden_dim, self.moe.intermediate_size_per_partition
+            for weight, shape in (
+                (layer.w13_weight, (experts, hidden, 2 * intermediate)),
+                (layer.w2_weight, (experts, intermediate, hidden)),
+            ):
+                if weight.dtype != torch.bfloat16 or weight.shape != shape or shape[-1] % 16:
+                    raise ValueError("ZercMoE requires BF16 ND expert weights with 16-aligned output dimensions")
+            # ZercMoE packs ND into zN at execution; decode reads the ND weights.
+        elif enable_fused_mc2:
             use_megamoe = use_cann_megamoe(get_current_vllm_config())
             if not use_megamoe:
                 layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)

@@ -66,6 +66,7 @@ class HardwareCapability(Enum):
     SCATTER_ND_FP8_CACHE_STORE = auto()
     # Allow the CANN MegaMoe fused-MC2 path when its model, EP, and config checks pass.
     CANN_MEGAMOE = auto()
+    ZERCMOE = auto()
     # Allow A5 MegaMoe's MXFP-only path and its A5-specific calling conventions.
     CANN_MEGAMOE_MXFP = auto()
     # Split a mixed chunked-prefill batch into separate prefill and decode FIA calls.
@@ -305,7 +306,11 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             moe_comm_policy=MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY,
             quantization_backend_family=QuantizationBackendFamily.STANDARD,
             capabilities=_STANDARD_CAPABILITIES
-            | {HardwareCapability.RMS_NORM_CAST, HardwareCapability.MINIMAX_ECOSYSTEM_FA3},
+            | {
+                HardwareCapability.RMS_NORM_CAST,
+                HardwareCapability.MINIMAX_ECOSYSTEM_FA3,
+                HardwareCapability.ZERCMOE,
+            },
         ),
         AscendDeviceType.A3: HardwareProfile(
             _device_type=AscendDeviceType.A3,

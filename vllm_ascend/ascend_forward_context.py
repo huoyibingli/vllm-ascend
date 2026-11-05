@@ -19,6 +19,7 @@ from vllm_ascend.device.hardware_profile import (
 from vllm_ascend.mrv2_utils import use_v2_model_runner
 from vllm_ascend.quantization.quant_type import A5_SUPPORT_MEGA_MOE_QUANT_TYPES, QuantType
 from vllm_ascend.utils import (
+    enable_sp,
     has_layer_idx,
     is_moe_model,
 )
@@ -43,6 +44,7 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+    ZERC_MOE = 4
 
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
@@ -51,6 +53,11 @@ _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", defa
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 16384
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
+_ZERCMOE_MIN_BATCH_TOKENS = 64
+_ZERCMOE_MAX_TOKENS_PER_RANK = 4096
+_ZERCMOE_W8A8_ARCHITECTURES = frozenset({"Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"})
+_ZERCMOE_W8A8_SHAPE = (2560, 640, 512, 10)
+_ZERCMOE_W8A8_EP_SIZE = 8
 
 
 def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
@@ -111,6 +118,119 @@ def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
     )
 
 
+def is_zercmoe_supported_by_config(vllm_config: VllmConfig) -> bool:
+    if vllm_config is None:
+        return False
+    config = get_ascend_config()
+    if getattr(config, "enable_zerc_moe", 0) != 1:
+        return False
+
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    if (
+        not get_current_hardware_profile().supports(HardwareCapability.ZERCMOE)
+        or model is None
+        or not is_moe_model(vllm_config)
+        or model.dtype != torch.bfloat16
+        or not parallel.enable_expert_parallel
+        or not 1 < parallel.tensor_parallel_size <= 64
+        or parallel.pipeline_parallel_size != 1
+        or parallel.data_parallel_size != 1
+        or getattr(parallel, "prefill_context_parallel_size", 1) != 1
+        or getattr(parallel, "decode_context_parallel_size", 1) != 1
+        or getattr(parallel, "expert_placement_strategy", "linear") != "linear"
+        or getattr(parallel, "enable_eplb", False)
+        or config.eplb_config.dynamic_eplb
+        or config.eplb_config.num_redundant_experts
+        or config.mix_placement
+        or config.deepgemm_mega_moe
+        or config.xlite_graph_config.enabled
+        or getattr(model, "enable_sleep_mode", False)
+        or getattr(vllm_config, "weight_transfer_config", None) is not None
+        or getattr(vllm_config, "lora_config", None) is not None
+        or (vllm_config.use_v2_model_runner and vllm_config.speculative_config is not None)
+        or enable_sp(vllm_config)
+    ):
+        return False
+
+    text = model.hf_text_config
+    hidden = getattr(text, "hidden_size", None)
+    intermediate = getattr(text, "moe_intermediate_size", None)
+    if model.is_quantized:
+        return (
+            parallel.tensor_parallel_size == _ZERCMOE_W8A8_EP_SIZE
+            and vllm_config.speculative_config is None
+            and bool(_ZERCMOE_W8A8_ARCHITECTURES.intersection(model.architectures or ()))
+            and (hidden, intermediate, model.get_num_experts(), getattr(text, "num_experts_per_tok", None))
+            == _ZERCMOE_W8A8_SHAPE
+        )
+    if hidden is None:
+        hidden = model.get_hidden_size()
+    return (
+        hidden is not None
+        and intermediate is not None
+        and 1024 <= hidden <= 8192
+        and 512 <= intermediate <= 3072
+        and hidden % 16 == 0
+        and intermediate % 16 == 0
+    )
+
+
+def use_cann_zercmoe(vllm_config: VllmConfig) -> bool:
+    if not is_zercmoe_supported_by_config(vllm_config):
+        return False
+
+    from vllm_ascend.ops.fused_moe.zercmoe import zercmoe_available
+
+    return (
+        get_ep_group().world_size == vllm_config.parallel_config.tensor_parallel_size
+        and zercmoe_available(vllm_config.model_config.is_quantized)
+    )
+
+
+def get_zercmoe_tokens_capacity(vllm_config: VllmConfig) -> int:
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    return min((max_tokens + tp - 1) // tp, _ZERCMOE_MAX_TOKENS_PER_RANK) * tp
+
+
+def has_zercmoe_prefill(attn_metadata: Any, *, include_mixed: bool, with_prefill: bool = False) -> bool:
+    # Qwen's QSA plan covers every active row, including short prefill tails.
+    entries = attn_metadata.values() if isinstance(attn_metadata, dict) else (attn_metadata,)
+    for metadata in entries:
+        plan = getattr(metadata, "qsa_request_plan", None)
+        requests = getattr(plan, "requests", ())
+        if requests:
+            phases = (request.is_prefill for request in requests)
+            return any(phases) if include_mixed else all(phases)
+
+    if include_mixed:
+        return with_prefill or any(getattr(metadata, "num_prefills", 0) for metadata in entries)
+
+    confirmed_prefill = False
+    for metadata in entries:
+        if getattr(metadata, "num_decodes", 0) or getattr(metadata, "num_decode_tokens", 0):
+            return False
+        if getattr(metadata, "num_prefills", 0) and (
+            getattr(metadata, "num_decodes", None) == 0 or getattr(metadata, "num_decode_tokens", None) == 0
+        ):
+            confirmed_prefill = True
+    return confirmed_prefill
+
+
+def should_try_zercmoe(
+    attn_metadata: Any, graph_mode: CUDAGraphMode, in_profile_run: bool, *, with_prefill: bool = False
+) -> bool:
+    if graph_mode != CUDAGraphMode.NONE:
+        return False
+    config = get_ascend_config()
+    if getattr(config, "enable_zerc_moe", 0) != 1:
+        return False
+    return in_profile_run or has_zercmoe_prefill(
+        attn_metadata, include_mixed=config.zercmoe_batch_mode == "prefill_and_mixed", with_prefill=with_prefill
+    )
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -129,6 +249,7 @@ def set_ascend_forward_context(
     device_metadata_executor=None,
     has_sinks=False,
     eplb_heat_collection_status: bool = False,
+    with_prefill: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -169,6 +290,9 @@ def set_ascend_forward_context(
             vllm_config,
             is_draft_model=is_draft_model,
             draft_moe_quant_type=draft_moe_quant_type,
+            zercmoe_prefill=should_try_zercmoe(
+                attn_metadata, aclgraph_runtime_mode, in_profile_run, with_prefill=with_prefill
+            ),
         )
 
         forward_context.moe_comm_type = moe_comm_type
@@ -298,9 +422,11 @@ def set_mc2_mask(vllm_config, device):
     if _reserved_mc2_mask is not None:
         return
     if is_moe_model(vllm_config):
-        _reserved_mc2_mask = torch.zeros(
-            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.bool, device=device
-        )
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        if is_zercmoe_supported_by_config(vllm_config):
+            tp = vllm_config.parallel_config.tensor_parallel_size
+            max_tokens = (max_tokens + tp - 1) // tp * tp
+        _reserved_mc2_mask = torch.zeros(max_tokens, dtype=torch.bool, device=device)
     else:
         _reserved_mc2_mask = None
 
@@ -403,6 +529,8 @@ def select_moe_comm_method(
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
     draft_moe_quant_type: QuantType = QuantType.NONE,
+    *,
+    zercmoe_prefill: bool = False,
 ) -> MoECommType | None:
     """Select the MoE communication method from the active hardware policy,
     parallel settings, and token count.
@@ -413,6 +541,7 @@ def select_moe_comm_method(
         is_draft_model (bool): Whether the model runs in MTP mode.
         draft_moe_quant_type (QuantType): The draft model's MoE quantization
             type, used on A5 to decide whether the draft can use mega moe.
+        zercmoe_prefill: An eager prefill, mixed, or memory-profiling batch.
     Returns:
         MoECommType | None: The selected MoE communication method.
     """
@@ -435,6 +564,15 @@ def select_moe_comm_method(
         # is a single fused C++ op. This covers both normal model
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
+    elif (
+        zercmoe_prefill
+        and not is_draft_model
+        and num_tokens is not None
+        and num_tokens > _ZERCMOE_MIN_BATCH_TOKENS
+        and use_cann_zercmoe(vllm_config)
+        and num_tokens <= get_zercmoe_tokens_capacity(vllm_config)
+    ):
+        moe_comm_type = MoECommType.ZERC_MOE
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
     else:
