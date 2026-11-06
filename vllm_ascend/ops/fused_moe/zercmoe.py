@@ -68,11 +68,35 @@ def validate_w8a8_zercmoe_weights(layer) -> None:
 
 
 def build_w8a8_zercmoe_weights(layer, encode_scale) -> MoEWeights:
-    """Build MegaMoE-style TensorLists from stacked NZ weights and packed scales."""
+    """Pack stacked ND int8 weights into per-expert zN lists (kernel zN layout).
+
+    The zerc_moe_int8 kernel expects the same layout gen_data.py's
+    convert_nd_to_nz_int8 produces: per expert (cols/32, rows, 32) -- i.e.
+    32-column inner blocks over 16-aligned rows. This is NOT the 16-wide bf16
+    zN of ``pack_bf16_zercmoe_weights`` and NOT vLLM ACL FRACTAL_NZ
+    (verified against Task-1 gen_data test bins). Runs AFTER the grouped-
+    matmul transpose in process_weights_after_loading but BEFORE
+    npu_format_cast, so ``w13_weight`` is the POST-transpose [E, hidden,
+    2*intermediate] and ``w2_weight`` the [E, intermediate, hidden] ND.
+    """
     experts = layer.moe_config.num_local_experts
+    w1, w2 = layer.w13_weight.detach(), layer.w2_weight.detach()
+
+    def to_zn(w):
+        # [E, a, b] ND -> per-expert (b/32, a, 32) flattened int8 zN blocks
+        # (gen_data convert_nd_to_nz_int8 layout), cat into one contiguous
+        # tensor, then unbind back to per-expert 1D slices. The wheel's
+        # FlattenInt8WeightList detects the contiguous storage and passes it
+        # to the kernel zero-copy.
+        e, a, b = w.shape
+        if b % 32 != 0 or a % 16 != 0:
+            raise ValueError(f"to_zn: shape ({a},{b}) not alignable to int8 zN (rows%16, cols%32)")
+        packed = w.view(e, a, b // 32, 32).permute(0, 2, 1, 3).contiguous().view(e, -1)
+        return list(packed.unbind(0))
+
     return MoEWeights(
-        w1=list(layer.w13_weight.detach().unbind(0)),
-        w2=list(layer.w2_weight.detach().unbind(0)),
+        w1=to_zn(w1),
+        w2=to_zn(w2),
         w1_scale=list(encode_scale(layer.w13_weight_scale.detach()).view(experts, -1).unbind(0)),
         w2_scale=list(encode_scale(layer.w2_weight_scale.detach()).view(experts, -1).unbind(0)),
     )

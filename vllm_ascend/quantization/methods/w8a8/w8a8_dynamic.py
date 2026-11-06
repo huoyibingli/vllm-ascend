@@ -278,17 +278,23 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         return weights
 
     def process_weights_after_loading(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
         use_zercmoe = (
             self.quant_type == QuantType.W8A8
             and getattr(get_ascend_config(), "enable_zerc_moe", 0) == 1
             and use_cann_zercmoe(get_current_vllm_config())
         )
+        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
+        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        # ZercMoE packs from the POST-transpose layout ([E, k, 2I] / [E, I, k]),
+        # so validate + build must run after the grouped-matmul transpose but
+        # before npu_format_cast below (which converts .data to internal format).
         if use_zercmoe:
             validate_w8a8_zercmoe_weights(layer)
+            layer.zercmoe_weights = build_w8a8_zercmoe_weights(layer, scale_from_float_to_int64)
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
-        # can only support weight nz.
+        # can only support weight nz. The NZ cast is ALSO required by the
+        # decode path (FUSED_MC2 dispatch_ffn_combine consumes w13/w2 in NZ);
+        # ZercMoE eager prefill reads layer.zercmoe_weights instead.
         if self.quant_type == QuantType.W8A8:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
@@ -347,9 +353,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             activation = getattr(activation, "value", activation)
             if activation != "swigluoai_uninterleave":
                 del layer.w13_weight_scale_fp32
-
-        if use_zercmoe:
-            layer.zercmoe_weights = build_w8a8_zercmoe_weights(layer, scale_from_float_to_int64)
 
     def _get_mlp_weights(self, layer: torch.nn.Module) -> tuple:
         """Return (w1, w1_scale, w2, w2_scale) in the standard MLP layout."""
