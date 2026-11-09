@@ -16,4 +16,4 @@ exec vllm serve "${MODEL_PATH:-/data/Qwen3.5-35B-A3B}" \
   --async-scheduling --reasoning-parser qwen3 \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,24,32]}' \
-  --additional-config "$(cat "$script_dir/single.json")"
+  --additional-config "$(cat "$script_dir/cumulative.json")"

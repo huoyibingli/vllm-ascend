@@ -26,19 +26,26 @@ its allocator internally uses 2I. The flag selects that contract while legacy
 flag-off execution preserves the earlier 2I call convention. Do not enable this
 flag against an old ND-only operator or update legacy package semantics blindly.
 
-## Single-feature branch
+## Cumulative branch
 
 ```bash
-git fetch origin test/single-megamoe-bf16-nz
-git switch test/single-megamoe-bf16-nz
+git fetch origin test/text-06-megamoe-bf16-nz
+git switch test/text-06-megamoe-bf16-nz
 ASCEND_RT_VISIBLE_DEVICES=2,3 MODEL_PATH=/data/Qwen3.5-35B-A3B \
-  bash examples/qwen35_megamoe_bf16_nz/serve_single.sh
+  bash examples/qwen35_megamoe_bf16_nz/serve_cumulative.sh
 ```
 
 When `origin` points upstream, fetch the branch from the user's fork instead.
-The single-feature configuration keeps other optimizations disabled and GDN on
-its default path. `weight_nz_mode=1` leaves unrelated dense weights under the
-baseline policy; routed experts use NZ because of the explicit new flag.
+The cumulative configuration retains NZ mode 2, text fusion, FLA GDN chunk 128,
+shared-expert overlap and dense next_input/gdn_out prefetch. The shared-overlap
+opt-in remains enabled. The old qwen35_megamoe_decode_nz second cache is explicitly
+disabled: ordinary GMM now reads the same NZ experts as MegaMoe on all layers.
+The routed_w2 prefetch target is excluded by the existing EP/NZ guard.
+
+Dense prefetch still runs only on eligible ALLGATHER decode steps; it is not
+inserted inside the fused MegaMoe call. The mixed-prefill experiment remains
+excluded. These combined performance effects require measurement.
+
 Preserve CANN's environment without adding a source-tree PYTHONPATH override.
 
 ## Validation

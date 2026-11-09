@@ -1,0 +1,28 @@
+{
+  "weight_nz_mode": 2,
+  "enable_flashcomm1": false,
+  "multistream_overlap_shared_expert": true,
+  "enable_fused_mc2": 2,
+  "mega_moe_bf16_nz": true,
+  "mega_moe_prefill_token_threshold": 64,
+  "mega_moe_max_tokens": 131072,
+  "enable_cpu_binding": true,
+  "allow_megamoe_shared_expert_overlap": true,
+  "enable_fla_gdn": true,
+  "fla_chunk_size": 128,
+  "qwen35_megamoe_decode_nz": {
+    "enabled": false
+  },
+  "qwen35_weight_prefetch": {
+    "enabled": true,
+    "allow_ep_nz_dense": true,
+    "targets": [
+      "next_input",
+      "gdn_out"
+    ],
+    "mode": "full",
+    "next_input_bytes": 2097152,
+    "gdn_out_bytes": 2097152,
+    "min_decode_concurrency": 8
+  }
+}
