@@ -39,6 +39,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.force_eplb import get_force_eplb_topk
+from vllm_ascend.ops.fused_moe.megamoe_bf16_nz import make_bf16_nz_expert_weights
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     FusedExpertsResult,
@@ -110,12 +111,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
         replace_parameter(layer, "w2_weight", w2_data)
 
-        # TODO: Current dispatch_ffn_combine/mega_moe fusion operator ONLY supports NZ format.
-        # Therefore, we must cast weights to NZ when fusion is enabled.
-        # Once the underlying dispatch_ffn_combine/mega_moe operator is updated to support
-        # ND format (or other formats), remove this specific 'if' check and the forced
-        # npu_format_cast. At that point, the operator should be able to handle weights
-        # in their native format without explicit casting here.
+        # Legacy MegaMoe uses ND lists; the opt-in new package shares NZ lists with GMM.
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2:
             use_megamoe = use_cann_megamoe(get_current_vllm_config())
@@ -132,8 +128,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
                     layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
                 else:
-                    layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
-                    layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
+                    if use_megamoe and get_ascend_config().mega_moe_bf16_nz:
+                        layer.w13_weight_list, layer.w2_weight_list = make_bf16_nz_expert_weights(
+                            layer.w13_weight.data, layer.w2_weight.data
+                        )
+                    else:
+                        layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
+                        layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
                     del layer.w13_weight
                     del layer.w2_weight
                     torch.npu.empty_cache()

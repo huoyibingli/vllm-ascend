@@ -29,7 +29,12 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import (
+    DeviceAdaptorFamily,
+    HardwareCapability,
+    MoECommPolicy,
+    get_current_hardware_profile,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -598,6 +603,8 @@ class AscendConfig:
     # count exceeds it, tokens may be truncated, causing precision
     # degradation. Do not set it too large because workspace memory scales
     # linearly with this value. Default 65536.
+    # Requires the new A2 BF16 NZ operator AND Torch adapter package.
+    mega_moe_bf16_nz: bool = False
     mega_moe_prefill_token_threshold: int = 64
     mega_moe_max_tokens: int = 65536
     ascend_log_path: str = dataclasses.field(
@@ -973,6 +980,7 @@ class AscendConfig:
 
         # sparse KV offload vs packed SFA main cache mutex
         self._validate_sparse_packed_kv_offload_compatibility()
+        self._validate_megamoe_bf16_nz(vc, effective_flashcomm)
         return self
 
     @property
@@ -1051,6 +1059,51 @@ class AscendConfig:
         if self.mix_placement:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
+
+    def _validate_megamoe_bf16_nz(self, vc: VllmConfig, effective_flashcomm: bool) -> None:
+        if not self.mega_moe_bf16_nz:
+            return
+        legacy_cache = getattr(self, "qwen35_megamoe_decode_nz", None)
+        if legacy_cache is not None and legacy_cache.enabled:
+            raise ValueError("Disable qwen35_megamoe_decode_nz: mega_moe_bf16_nz shares one NZ layout")
+        parallel = vc.parallel_config
+        model = vc.model_config
+        hf = model.hf_text_config
+        profile = get_current_hardware_profile()
+        if (
+            self.enable_fused_mc2 != 1
+            or not is_mega_moe_supported()
+            or not profile.supports(HardwareCapability.CANN_MEGAMOE)
+            or profile.moe_comm_policy is not MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY
+            or not parallel.enable_expert_parallel
+            or parallel.tensor_parallel_size != 2
+            or parallel.data_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or getattr(parallel, "decode_context_parallel_size", 1) != 1
+            or getattr(parallel, "use_sequence_parallel_moe", False)
+            or effective_flashcomm
+            or str(model.dtype) != "torch.bfloat16"
+            or getattr(hf, "model_type", None) != "qwen3_5_moe_text"
+            or tuple(
+                getattr(hf, key, None)
+                for key in ("num_hidden_layers", "hidden_size", "num_experts", "moe_intermediate_size")
+            )
+            != (40, 2048, 256, 512)
+            or vc.quant_config is not None
+            or vc.lora_config is not None
+            or vc.speculative_config is not None
+            or vc.use_v2_model_runner
+            or model.enable_sleep_mode
+            or vc.weight_transfer_config is not None
+            or vc.kv_transfer_config is not None
+            or self.eplb_config.dynamic_eplb
+            or self.enable_force_eplb
+        ):
+            raise ValueError(
+                "mega_moe_bf16_nz requires new A2 MegaMoe, static Qwen3.5-35B BF16 TP2/EP2 DP1/PP1, "
+                "runner v1; no FlashComm, SP/CP, quantization, LoRA, speculation, sleep, transfer or EPLB"
+            )
 
     @staticmethod
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:

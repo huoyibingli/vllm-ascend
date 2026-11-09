@@ -32,6 +32,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInp
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
+from vllm_ascend.ops.fused_moe.megamoe_bf16_nz import mega_moe_buffer_intermediate_size
 from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
@@ -460,7 +461,9 @@ class FusedMC2CommImpl(MoECommMethod):
             num_max_tokens_per_rank,
             num_topk,
             hidden=self.moe_config.hidden_dim,
-            intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
+            intermediate_hidden=mega_moe_buffer_intermediate_size(
+                self.moe_config.intermediate_size_per_partition, get_ascend_config().mega_moe_bf16_nz
+            ),
             max_recv_token_num=max_recv_token_num,
             dispatch_quant_mode=dispatch_quant_mode,
             dispatch_quant_out_dtype=dispatch_quant_out_dtype,
