@@ -1,9 +1,11 @@
 # Qwen3.5 A2 MegaMoe BF16 NZ experiment
 
 `additional_config.mega_moe_bf16_nz=true` selects a single persistent set of
-per-expert BF16 FRACTAL_NZ weights for both MegaMoe and ordinary GMM. It defaults
+batched 3D BF16 FRACTAL_NZ parameters for both MegaMoe and ordinary GMM. It defaults
 to false and requires `enable_fused_mc2=2`. Conversion happens after loading,
-before profile/graph capture. No forward-time ND conversion or weight swap is
+before profile/graph capture, only when the source is ND; already-NZ tensors are
+reused. The loader retains `w13_weight` and `w2_weight` as registered parameters.
+No per-expert split, forward-time ND conversion or weight swap is
 introduced. Activations and final outputs remain ND.
 
 This port targets static Qwen3.5-35B-A3B, BF16, A2, TP2/EP2, DP1/PP1 and runner
@@ -14,13 +16,19 @@ this branch does not include the separate mixed-prefill experiment.
 ## Operator requirement
 
 Install matching new operator binaries and the Torch adapter containing the
-A2 BF16 NZ checks. The actual `cann_ops_transformer.ops` imported by vLLM must
+A2 **batched** BF16 NZ support from `feature/mega-moe-bf16-nz-910b`
+(commit `be5f766ef` or a compatible successor).
+The actual `cann_ops_transformer.ops` imported by vLLM must
 refer to that build. Installing only a separate custom namespace is insufficient.
 The installed package cannot be verified from Python function signatures alone;
 run the two-card regression before serving. There is no silent fallback to ND.
 
-The new package must accept complete per-expert 2D format-29 tensors with zero
-storage offset, logical W13 `[2048,1024]` and W2 `[512,2048]`, 128 local experts.
+The new package must accept single-item TensorLists containing complete 3D
+format-29 tensors with zero storage offset: W13 `[128,2048,1024]` and W2
+`[128,512,2048]`, with physical NZ shapes `[128,64,128,16,16]` and
+`[128,128,32,16,16]`. Expert strides are 2,097,152 and 1,048,576 BF16 elements.
+The operator must set `expertPerRank=128` and `listLen=1`; the old split-only
+BF16 NZ package is insufficient. Both backends read the same two allocations.
 It must take I=512 in `get_symm_buffer_for_mega_moe(intermediate_hidden=...)`;
 its allocator internally uses 2I. The flag selects that contract while legacy
 flag-off execution preserves the earlier 2I call convention. Do not enable this

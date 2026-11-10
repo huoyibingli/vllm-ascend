@@ -63,7 +63,8 @@ def main():
         w1.unsqueeze(0).repeat(EXPERTS // 2, 1, 1), w2.unsqueeze(0).repeat(EXPERTS // 2, 1, 1)
     )
     weights = MoEWeights(w1=nz1, w2=nz2)
-    # Ordinary GMM must consume the identical persistent NZ expert tensors.
+    assert len(nz1) == len(nz2) == 1 and nz1[0].ndim == nz2[0].ndim == 3
+    # Ordinary GMM must consume the identical persistent 3D NZ allocations.
     gmm_x = torch.full((EXPERTS // 2, HIDDEN), 0.25, device="npu", dtype=torch.bfloat16)
     groups = torch.ones(EXPERTS // 2, device="npu", dtype=torch.int64)
     gate_up = torch_npu.npu_grouped_matmul(

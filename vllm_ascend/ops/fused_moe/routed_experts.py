@@ -111,7 +111,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
         replace_parameter(layer, "w2_weight", w2_data)
 
-        # Legacy MegaMoe uses ND lists; the opt-in new package shares NZ lists with GMM.
+        # Legacy MegaMoe uses ND lists; the new package shares 3D NZ parameters with GMM.
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2:
             use_megamoe = use_cann_megamoe(get_current_vllm_config())
@@ -129,14 +129,14 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
                 else:
                     if use_megamoe and get_ascend_config().mega_moe_bf16_nz:
-                        layer.w13_weight_list, layer.w2_weight_list = make_bf16_nz_expert_weights(
-                            layer.w13_weight.data, layer.w2_weight.data
-                        )
+                        w13_nz, w2_nz = make_bf16_nz_expert_weights(layer.w13_weight.data, layer.w2_weight.data)
+                        layer.w13_weight.data = w13_nz[0]
+                        layer.w2_weight.data = w2_nz[0]
                     else:
                         layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
                         layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
-                    del layer.w13_weight
-                    del layer.w2_weight
+                        del layer.w13_weight
+                        del layer.w2_weight
                     torch.npu.empty_cache()
         else:
             layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)

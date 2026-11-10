@@ -603,7 +603,7 @@ class AscendConfig:
     # count exceeds it, tokens may be truncated, causing precision
     # degradation. Do not set it too large because workspace memory scales
     # linearly with this value. Default 65536.
-    # Requires the new A2 BF16 NZ operator AND Torch adapter package.
+    # Requires the A2 batched BF16 NZ operator AND Torch adapter package.
     mega_moe_bf16_nz: bool = False
     mega_moe_prefill_token_threshold: int = 64
     mega_moe_max_tokens: int = 65536
