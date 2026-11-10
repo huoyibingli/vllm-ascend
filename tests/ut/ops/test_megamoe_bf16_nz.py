@@ -15,32 +15,38 @@ def formats(monkeypatch):
 
     def cast(value, fmt):
         result = value.clone()
-        values[id(result)] = fmt
+        values[result.data_ptr()] = fmt
         calls.append((value, result))
         return result
 
-    monkeypatch.setattr(nz.torch_npu, "get_npu_format", lambda value: values.get(id(value), 2))
+    monkeypatch.setattr(nz.torch_npu, "get_npu_format", lambda value: values.get(value.data_ptr(), 2))
     monkeypatch.setattr(nz.torch_npu, "npu_format_cast", cast)
     return values, calls
 
 
 @pytest.mark.parametrize("experts,hidden,intermediate", [(3, 32, 16), (1, 2048, 512)])
-def test_experts_are_complete_stable_nz_matrices(formats, experts, hidden, intermediate):
+def test_experts_are_complete_stable_batched_nz_tensors(formats, experts, hidden, intermediate):
     values, calls = formats
     w13 = torch.randn(experts, hidden, 2 * intermediate, dtype=torch.bfloat16)
     w2 = torch.randn(experts, intermediate, hidden, dtype=torch.bfloat16)
     a, b = nz.make_bf16_nz_expert_weights(w13, w2)
-    assert len(calls) == 2 * experts
+    assert len(calls) == 2
     for source, output in ((w13, a), (w2, b)):
-        for i, weight in enumerate(output):
-            torch.testing.assert_close(weight, source[i], rtol=0, atol=0)
-            assert weight.ndim == 2 and weight.storage_offset() == 0 and weight.is_contiguous()
-            assert values[id(weight)] == 29
-            assert weight.data_ptr() != source[i].data_ptr()
-    assert len({weight.data_ptr() for weight in a + b}) == 2 * experts
+        assert len(output) == 1
+        weight = output[0]
+        torch.testing.assert_close(weight, source, rtol=0, atol=0)
+        assert weight.ndim == 3 and weight.storage_offset() == 0 and weight.is_contiguous()
+        assert values[weight.data_ptr()] == 29
+        assert weight.data_ptr() != source.data_ptr()
+    # An already-packed parameter must be reused without any additional cast.
+    reused_a, reused_b = nz.make_bf16_nz_expert_weights(a[0], b[0])
+    assert reused_a[0] is a[0] and reused_b[0] is b[0]
+    assert len(calls) == 2
 
 
-@pytest.mark.parametrize("invalid", ["dtype", "shape", "experts", "unaligned", "nz_source", "empty", "dimensions"])
+@pytest.mark.parametrize(
+    "invalid", ["dtype", "shape", "experts", "unaligned", "format", "empty", "dimensions", "too_many", "zero_width"]
+)
 def test_reject_invalid_sources(formats, invalid):
     values, calls = formats
     a = torch.zeros(2, 32, 32, dtype=torch.bfloat16)
@@ -53,29 +59,53 @@ def test_reject_invalid_sources(formats, invalid):
         b = b[:1]
     elif invalid == "unaligned":
         a, b = a[:, :31], b[:, :, :31]
-    elif invalid == "nz_source":
-        values[id(a)] = 29
+    elif invalid == "format":
+        values[a.data_ptr()] = 3
     elif invalid == "empty":
         a, b = a[:0], b[:0]
     elif invalid == "dimensions":
         a = a[0]
+    elif invalid == "too_many":
+        a, b = a[:1].expand(129, -1, -1), b[:1].expand(129, -1, -1)
+    elif invalid == "zero_width":
+        a, b = a[:, :, :0], b[:, :0]
     with pytest.raises(ValueError, match="3D ND"):
         nz.make_bf16_nz_expert_weights(a, b)
     assert not calls
 
 
-@pytest.mark.parametrize("broken", ["format", "offset"])
+@pytest.mark.parametrize("broken", ["format", "offset", "shape", "strides"])
 def test_reject_incomplete_cast_result(monkeypatch, broken):
     a = torch.zeros(2, 32, 32, dtype=torch.bfloat16)
     b = torch.zeros(2, 16, 32, dtype=torch.bfloat16)
     monkeypatch.setattr(
         nz.torch_npu, "get_npu_format", lambda v: 2 if v is a or v is b else (2 if broken == "format" else 29)
     )
-    monkeypatch.setattr(
-        nz.torch_npu, "npu_format_cast", lambda v, _: torch.zeros(v.shape[0] + 1, v.shape[1], dtype=v.dtype)[1:]
-    )
+
+    def broken_cast(v, _):
+        if broken == "offset":
+            return torch.zeros(v.shape[0] + 1, *v.shape[1:], dtype=v.dtype)[1:]
+        if broken == "shape":
+            return torch.zeros(v.shape[0], v.shape[1], v.shape[2] + 16, dtype=v.dtype)
+        if broken == "strides":
+            return v.transpose(1, 2)
+        return v.clone()
+
+    monkeypatch.setattr(nz.torch_npu, "npu_format_cast", broken_cast)
     with pytest.raises(RuntimeError, match="complete format-29"):
         nz.make_bf16_nz_expert_weights(a, b)
+
+
+@pytest.mark.parametrize("sliced", [False, True])
+def test_reject_invalid_already_nz_view(formats, sliced):
+    values, calls = formats
+    a = torch.zeros(3, 32, 32, dtype=torch.bfloat16)
+    b = torch.zeros(2, 16, 32, dtype=torch.bfloat16)
+    a = a[1:] if sliced else a[:2].transpose(1, 2)
+    values[a.data_ptr()] = values[b.data_ptr()] = 29
+    with pytest.raises(RuntimeError, match="complete format-29"):
+        nz.make_bf16_nz_expert_weights(a, b)
+    assert not calls
 
 
 @pytest.mark.parametrize("enabled,expected", [(False, 1024), (True, 512)])
@@ -235,7 +265,7 @@ def test_old_dual_cache_cannot_be_enabled_with_shared_layout():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_loader_and_both_backends_share_expert_lists(monkeypatch, formats, enabled):
+def test_loader_and_both_backends_share_weights(monkeypatch, formats, enabled):
     from vllm_ascend.ops.fused_moe import routed_experts as routed
 
     base = routed.UnquantizedFusedMoEMethod.__mro__[1]
@@ -262,12 +292,23 @@ def test_loader_and_both_backends_share_expert_lists(monkeypatch, formats, enabl
     method.dynamic_eplb = False
     method._maybe_pad_weight = lambda value: value
     method.process_weights_after_loading(layer)
-    assert not hasattr(layer, "w13_weight") and not hasattr(layer, "w2_weight")
     gmm1, gmm2 = method.get_mlp_weights(layer)
     fused = method.get_fused_mc2_weights(layer)
-    assert gmm1 is fused.w1 is layer.w13_weight_list
-    assert gmm2 is fused.w2 is layer.w2_weight_list
-    for weights, source in ((gmm1, original1), (gmm2, original2)):
-        for index, weight in enumerate(weights):
-            torch.testing.assert_close(weight, source[index].T, rtol=0, atol=0)
-            assert formats[0].get(id(weight), 2) == (29 if enabled else 2)
+    if enabled:
+        assert not hasattr(layer, "w13_weight_list") and not hasattr(layer, "w2_weight_list")
+        assert gmm1 is layer.w13_weight is fused.w1[0]
+        assert gmm2 is layer.w2_weight is fused.w2[0]
+        assert len(fused.w1) == len(fused.w2) == 1
+        assert set(dict(layer.named_parameters())) == {"w13_weight", "w2_weight"}
+        assert len(formats[1]) == 2
+        for weight, source in ((gmm1, original1), (gmm2, original2)):
+            torch.testing.assert_close(weight, source.transpose(1, 2), rtol=0, atol=0)
+            assert formats[0][weight.data_ptr()] == 29
+    else:
+        assert not hasattr(layer, "w13_weight") and not hasattr(layer, "w2_weight")
+        assert gmm1 is fused.w1 is layer.w13_weight_list
+        assert gmm2 is fused.w2 is layer.w2_weight_list
+        assert not formats[1]
+        for weights, source in ((gmm1, original1), (gmm2, original2)):
+            for index, weight in enumerate(weights):
+                torch.testing.assert_close(weight, source[index].T, rtol=0, atol=0)

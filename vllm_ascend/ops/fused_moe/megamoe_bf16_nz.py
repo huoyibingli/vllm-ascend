@@ -1,50 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One persistent BF16 NZ expert layout for MegaMoe and ordinary GMM."""
+"""One persistent batched BF16 NZ layout for MegaMoe and ordinary GMM."""
 
 import torch
 import torch_npu
 
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
+NZ_BLOCK_SIZE = 16
+MAX_LOCAL_EXPERTS = 128
+ND_FORMATS = (0, 2)
+
 
 def make_bf16_nz_expert_weights(w13: torch.Tensor, w2: torch.Tensor):
-    """Convert complete ND expert matrices once, before graph capture.
+    """Return single-item lists containing complete [E,K,N] NZ tensors.
 
-    Slicing a stacked NZ tensor does not produce the standalone storage
-    descriptors required by the A2 MegaMoe Torch adapter.
+    Pack ND weights once before graph capture; reuse already-NZ parameters.
+    Requires the A2 operator/adapter with batched BF16 NZ support.
     """
     if (
         w13.dtype != torch.bfloat16
         or w2.dtype != torch.bfloat16
         or w13.ndim != 3
         or w2.ndim != 3
-        or w13.shape[0] == 0
+        or not 1 <= w13.shape[0] <= MAX_LOCAL_EXPERTS
         or w13.shape[0] != w2.shape[0]
         or w13.shape[1] != w2.shape[2]
         or w13.shape[2] != 2 * w2.shape[1]
         or w13.device != w2.device
-        or any(dim % 16 for dim in (*w13.shape[1:], *w2.shape[1:]))
-        or any(torch_npu.get_npu_format(weight) not in (0, 2) for weight in (w13, w2))
+        or any(dim <= 0 or dim % NZ_BLOCK_SIZE for dim in (*w13.shape[1:], *w2.shape[1:]))
+        or any(torch_npu.get_npu_format(weight) not in (*ND_FORMATS, ACL_FORMAT_FRACTAL_NZ) for weight in (w13, w2))
     ):
-        raise ValueError("MegaMoe BF16 NZ requires matching aligned 3D ND W13/W2 source weights")
+        raise ValueError("MegaMoe BF16 NZ requires matching aligned 3D ND/NZ W13/W2 source weights (1-128 experts)")
 
     def convert(weight):
-        experts = []
-        for source in weight.unbind(0):
-            # Clone the ND slice before packing; no nonzero storage offset or
-            # stacked-NZ alias may escape into the fused operator.
-            expert = torch_npu.npu_format_cast(source.clone(), ACL_FORMAT_FRACTAL_NZ)
-            if (
-                expert.dtype != torch.bfloat16
-                or expert.shape != source.shape
-                or expert.device != source.device
-                or expert.storage_offset() != 0
-                or not expert.is_contiguous()
-                or torch_npu.get_npu_format(expert) != ACL_FORMAT_FRACTAL_NZ
-            ):
-                raise RuntimeError("MegaMoe BF16 NZ conversion did not produce a complete format-29 matrix")
-            experts.append(expert)
-        return experts
+        packed = (
+            weight
+            if torch_npu.get_npu_format(weight) == ACL_FORMAT_FRACTAL_NZ
+            else torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ)
+        )
+        if (
+            packed.dtype != torch.bfloat16
+            or packed.shape != weight.shape
+            or packed.device != weight.device
+            or packed.storage_offset() != 0
+            or not packed.is_contiguous()
+            or torch_npu.get_npu_format(packed) != ACL_FORMAT_FRACTAL_NZ
+        ):
+            raise RuntimeError("MegaMoe BF16 NZ requires a complete format-29 batched tensor")
+        return [packed]
 
     return convert(w13), convert(w2)
 
