@@ -6,7 +6,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 import torch
-from vllm.config import CUDAGraphMode
+from vllm.config import CompilationMode, CUDAGraphMode
 
 from vllm_ascend import ascend_forward_context as afc
 from vllm_ascend.device.hardware_profile import MoECommPolicy
@@ -30,6 +30,57 @@ class TestZercMoE(TestCase):
             self.assertFalse(afc.should_try_zercmoe(metadata(True, False), CUDAGraphMode.FULL, False))
             self.assertFalse(afc.should_try_zercmoe(None, CUDAGraphMode.NONE, False))
             self.assertTrue(afc.should_try_zercmoe(None, CUDAGraphMode.NONE, True))
+
+    def test_all_mode_accepts_every_eager_phase(self):
+        config = SimpleNamespace(enable_zerc_moe=1, zercmoe_batch_mode="all")
+        with patch.object(afc, "get_ascend_config", return_value=config):
+            for metadata in (
+                SimpleNamespace(num_prefills=1, num_decodes=0),
+                SimpleNamespace(num_prefills=1, num_decodes=1),
+                SimpleNamespace(num_prefills=0, num_decodes=1),
+                None,
+            ):
+                with self.subTest(metadata=metadata):
+                    self.assertTrue(afc.should_try_zercmoe(metadata, CUDAGraphMode.NONE, False))
+                    for graph_mode in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL):
+                        self.assertFalse(afc.should_try_zercmoe(metadata, graph_mode, False))
+            config.enable_zerc_moe = 0
+            self.assertFalse(afc.should_try_zercmoe(None, CUDAGraphMode.NONE, True))
+
+    def test_all_mode_disables_compilation_and_decode_graphs(self):
+        from vllm_ascend.platform import _update_compilation_modes
+
+        for batch_mode in ("prefill", "prefill_and_mixed", "all"):
+            for graph_mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY):
+                for enabled, supported in ((1, True), (0, True), (1, False)):
+                    with self.subTest(mode=batch_mode, graph=graph_mode, enabled=enabled, supported=supported):
+                        config = SimpleNamespace(
+                            model_config=SimpleNamespace(enforce_eager=False, is_encoder_decoder=False),
+                            compilation_config=SimpleNamespace(
+                                mode=CompilationMode.VLLM_COMPILE, cudagraph_mode=graph_mode, splitting_ops=None
+                            ),
+                            additional_config={},
+                        )
+                        ascend_config = SimpleNamespace(
+                            ascend_compilation_config={},
+                            xlite_graph_config=SimpleNamespace(enabled=False),
+                            enable_zerc_moe=enabled,
+                            zercmoe_batch_mode=batch_mode,
+                        )
+                        with patch.object(afc, "is_zercmoe_supported_by_config", return_value=supported):
+                            _update_compilation_modes(config, ascend_config)
+                        all_enabled = batch_mode == "all" and enabled == 1 and supported
+                        self.assertEqual(config.model_config.enforce_eager, all_enabled)
+                        self.assertEqual(
+                            config.compilation_config.mode,
+                            CompilationMode.NONE if all_enabled else CompilationMode.VLLM_COMPILE,
+                        )
+                        expected_graph = graph_mode
+                        if all_enabled:
+                            expected_graph = CUDAGraphMode.NONE
+                        elif enabled and supported and graph_mode == CUDAGraphMode.FULL:
+                            expected_graph = CUDAGraphMode.FULL_DECODE_ONLY
+                        self.assertEqual(config.compilation_config.cudagraph_mode, expected_graph)
 
     def test_selector_checks_capacity_and_draft(self):
         config = SimpleNamespace(
@@ -61,6 +112,38 @@ class TestZercMoE(TestCase):
                 )
             wheel.return_value = False
             self.assertEqual(afc.select_moe_comm_method(1024, config, zercmoe_prefill=True), afc.MoECommType.ALLGATHER)
+
+    def test_all_mode_routes_small_decode_batches_with_capacity_guard(self):
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_expert_parallel=True, tensor_parallel_size=8),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4095),
+        )
+        ascend_config = SimpleNamespace(deepgemm_mega_moe=False, enable_zerc_moe=1, zercmoe_batch_mode="all")
+        with (
+            patch.object(afc, "get_ascend_config", return_value=ascend_config),
+            patch.object(afc, "is_moe_model", return_value=True),
+            patch.object(afc, "get_ep_group", return_value=SimpleNamespace(world_size=8)),
+            patch.object(
+                afc,
+                "get_current_hardware_profile",
+                return_value=SimpleNamespace(moe_comm_policy=MoECommPolicy.ALLGATHER),
+            ),
+            patch.object(afc, "use_cann_zercmoe", return_value=True) as wheel,
+        ):
+            decode = SimpleNamespace(num_prefills=0, num_decodes=1)
+            eligible = afc.should_try_zercmoe(decode, CUDAGraphMode.NONE, False)
+            for tokens in (1, 7, 8, 64, 65, 4096):
+                with self.subTest(tokens=tokens):
+                    self.assertEqual(
+                        afc.select_moe_comm_method(tokens, config, zercmoe_prefill=eligible), afc.MoECommType.ZERC_MOE
+                    )
+            for tokens, phase, draft in ((0, True, False), (4097, True, False), (1, False, False), (1, True, True)):
+                self.assertEqual(
+                    afc.select_moe_comm_method(tokens, config, zercmoe_prefill=phase, is_draft_model=draft),
+                    afc.MoECommType.ALLGATHER,
+                )
+            wheel.return_value = False
+            self.assertEqual(afc.select_moe_comm_method(1, config, zercmoe_prefill=True), afc.MoECommType.ALLGATHER)
 
     def test_w8a8_payload_shares_weights_and_passes_scales(self):
         layer = SimpleNamespace(

@@ -293,8 +293,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.zercmoe_weights = build_w8a8_zercmoe_weights(layer, scale_from_float_to_int64)
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
         # can only support weight nz. The NZ cast is ALSO required by the
-        # decode path (FUSED_MC2 dispatch_ffn_combine consumes w13/w2 in NZ);
-        # ZercMoE eager prefill reads layer.zercmoe_weights instead.
+        # regular MoE path (FUSED_MC2 dispatch_ffn_combine consumes w13/w2 in NZ);
+        # ZercMoE batches read layer.zercmoe_weights instead.
         if self.quant_type == QuantType.W8A8:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)

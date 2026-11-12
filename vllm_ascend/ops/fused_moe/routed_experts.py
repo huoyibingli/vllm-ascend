@@ -139,7 +139,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             ):
                 if weight.dtype != torch.bfloat16 or weight.shape != shape or shape[-1] % 16:
                     raise ValueError("ZercMoE requires BF16 ND expert weights with 16-aligned output dimensions")
-            # ZercMoE packs ND into zN at execution; decode reads the ND weights.
+            # ZercMoE packs ND into zN at execution; the regular route reads ND.
         elif enable_fused_mc2:
             use_megamoe = use_cann_megamoe(get_current_vllm_config())
             if not use_megamoe:

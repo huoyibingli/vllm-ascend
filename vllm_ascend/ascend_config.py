@@ -642,7 +642,7 @@ class AscendConfig:
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
     enable_zerc_moe: Literal[0, 1] = dataclasses.field(default_factory=lambda: ascend_envs.VLLM_ASCEND_ENABLE_ZERC_MOE)
-    zercmoe_batch_mode: Literal["prefill", "prefill_and_mixed"] = "prefill"
+    zercmoe_batch_mode: Literal["prefill", "prefill_and_mixed", "all"] = "prefill"
     zercmoe_ipport: str | None = None
     zercmoe_shmem_mb: int | None = None
     # DeepSeek V4.1 FP8 x FP4 backend from DeepGEMM-Ascend (950, TP1/EP8).

@@ -225,8 +225,12 @@ def should_try_zercmoe(
     config = get_ascend_config()
     if getattr(config, "enable_zerc_moe", 0) != 1:
         return False
-    return in_profile_run or has_zercmoe_prefill(
-        attn_metadata, include_mixed=config.zercmoe_batch_mode == "prefill_and_mixed", with_prefill=with_prefill
+    return (
+        config.zercmoe_batch_mode == "all"
+        or in_profile_run
+        or has_zercmoe_prefill(
+            attn_metadata, include_mixed=config.zercmoe_batch_mode == "prefill_and_mixed", with_prefill=with_prefill
+        )
     )
 
 
@@ -540,7 +544,7 @@ def select_moe_comm_method(
         is_draft_model (bool): Whether the model runs in MTP mode.
         draft_moe_quant_type (QuantType): The draft model's MoE quantization
             type, used on A5 to decide whether the draft can use mega moe.
-        zercmoe_prefill: An eager prefill, mixed, or memory-profiling batch.
+        zercmoe_prefill: An eligible eager batch (including decode in all mode).
     Returns:
         MoECommType | None: The selected MoE communication method.
     """
@@ -567,7 +571,11 @@ def select_moe_comm_method(
         zercmoe_prefill
         and not is_draft_model
         and num_tokens is not None
-        and num_tokens > _ZERCMOE_MIN_BATCH_TOKENS
+        and num_tokens > 0
+        and (
+            getattr(get_ascend_config(), "zercmoe_batch_mode", "prefill") == "all"
+            or num_tokens > _ZERCMOE_MIN_BATCH_TOKENS
+        )
         and use_cann_zercmoe(vllm_config)
         and num_tokens <= get_zercmoe_tokens_capacity(vllm_config)
     ):

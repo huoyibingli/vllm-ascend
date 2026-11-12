@@ -79,7 +79,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `weight_nz_mode`                    | int  | `1`     | Weight NZ mode. `0` disables NZ, `1` enables NZ only for quantized weights, and `2` also enables NZ for BF16/FP16 weights when supported. The legacy `VLLM_ASCEND_ENABLE_NZ` environment variable is no longer supported. |
 | `enable_fused_mc2`                  | int  | `0`     | Fused MC2 configuration. `0` disables the fused path, `1` selects dispatch-FFN-combine, and `2` selects CANN MegaMoe when the model and parallel configuration support it. On A5, SiTU models require a CANN MegaMoe wrapper exposing `activation` and `activation_params`; both SiTU parameters are bound from the MoE configuration during initialization. The legacy `VLLM_ASCEND_ENABLE_FUSED_MC2` environment variable is no longer supported. |
 | `enable_zerc_moe` | int | `0` | Experimental A2 ZercMoE route. Requires a compatible external wheel. Set to `1` to enable. The environment default is `VLLM_ASCEND_ENABLE_ZERC_MOE`. |
-| `zercmoe_batch_mode` | str | `prefill` | Selects eager pure prefill. Set to `prefill_and_mixed` to also select eligible mixed prefill/decode batches. Pure decode retains the regular MoE route. |
+| `zercmoe_batch_mode` | str | `prefill` | `prefill` selects eager pure prefill; `prefill_and_mixed` also selects eligible mixed prefill/decode batches. `all` additionally selects pure decode and batches with 1–64 tokens, and automatically enforces eager execution for every phase. Model, topology, wheel and token-capacity restrictions still apply. |
 | `zercmoe_ipport` | str | `null` | SHMEM bootstrap address shared by all EP ranks. The single-node default is `tcp://127.0.0.1:28765`. |
 | `zercmoe_shmem_mb` | int | `null` | Positive per-rank SHMEM heap size in MB. The wheel sizes the heap automatically when unset. |
 | `enable_transpose_kv_cache_by_block`| bool | `True`  | Whether to enable transpose KV cache by block. The legacy `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` environment variable is no longer supported. |
@@ -93,6 +93,18 @@ The following table lists additional configuration options available in vLLM Asc
 | `combine_quant_mode`                | int  | `0`     | Fused MC2 configuration. This configuration will be passed as the `comm_quant_mode` argument for the `torch_npu.npu_moe_distribute_combine_v2` operator. Please refer to the operator documentation for the valid value range. |
 
 The details of each configuration option are as follows:
+
+<span id="zercmoe_batch_mode"></span>**zercmoe_batch_mode**
+
+To select ZercMoE for prefill, mixed and pure decode batches on a supported A2 model and EP topology, add:
+
+```bash
+--additional-config '{"enable_zerc_moe": 1, "zercmoe_batch_mode": "all"}'
+```
+
+`all` automatically disables graph execution and compilation, including decode graphs, so a separate `--enforce-eager` flag is unnecessary. It also removes the greater-than-64-token selection threshold used by `prefill` and `prefill_and_mixed`. The default remains `prefill`.
+
+All modes retain the existing model, quantization, topology and external-wheel requirements. Empty batches, draft-model execution and batches exceeding `min(ceil(max_num_batched_tokens / TP), 4096) * TP` tokens retain the regular MoE route. `all` does not increase the 4096-token per-rank capacity.
 
 <span id="runtime_guard"></span>**runtime_guard**
 

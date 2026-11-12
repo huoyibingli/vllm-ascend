@@ -1337,19 +1337,20 @@ def _update_compilation_modes(vllm_config: VllmConfig, ascend_config: AscendConf
         )
 
     graph_mode = compilation_config.cudagraph_mode
-    if (
-        getattr(ascend_config, "enable_zerc_moe", 0) == 1
-        and not enforce_eager
-        and graph_mode is not None
-        and graph_mode.mixed_mode() != CUDAGraphMode.NONE
-        and is_zercmoe_supported_by_config(vllm_config)
-    ):
-        compilation_config.cudagraph_mode = (
-            CUDAGraphMode.FULL_DECODE_ONLY if graph_mode.decode_mode() == CUDAGraphMode.FULL else CUDAGraphMode.NONE
-        )
-        logger.info_once(
-            "ZercMoE uses eager prefill and mixed batches; graph mode is %s.", compilation_config.cudagraph_mode
-        )
+    if getattr(ascend_config, "enable_zerc_moe", 0) == 1 and is_zercmoe_supported_by_config(vllm_config):
+        if ascend_config.zercmoe_batch_mode == "all":
+            # ZercMoE is eager-only. Decode must not retain a captured or
+            # compiled regular MoE path when all phases opt into ZercMoE.
+            enforce_eager = model_config.enforce_eager = True
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            logger.info_once("ZercMoE all mode uses eager execution for prefill, mixed and decode batches.")
+        elif not enforce_eager and graph_mode is not None and graph_mode.mixed_mode() != CUDAGraphMode.NONE:
+            compilation_config.cudagraph_mode = (
+                CUDAGraphMode.FULL_DECODE_ONLY if graph_mode.decode_mode() == CUDAGraphMode.FULL else CUDAGraphMode.NONE
+            )
+            logger.info_once(
+                "ZercMoE uses eager prefill and mixed batches; graph mode is %s.", compilation_config.cudagraph_mode
+            )
 
     if enforce_eager:
         logger.info("Compilation disabled, using eager mode by default")

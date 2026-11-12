@@ -1,0 +1,6 @@
+# Replace 0 with the PR number when submitting this change.
+pr: 0
+entries:
+  - category: feature
+    text: Added zercmoe_batch_mode=all for eligible prefill, mixed and pure decode batches, including batches with 1–64 tokens. This mode automatically uses eager execution and retains existing model, topology and token-capacity restrictions.
+    hardware: [A2]
