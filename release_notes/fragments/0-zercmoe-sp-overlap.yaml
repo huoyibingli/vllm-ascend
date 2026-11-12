@@ -1,0 +1,6 @@
+# Replace 0 with the PR number when submitting this change.
+pr: 0
+entries:
+  - category: feature
+    text: Enabled the experimental A2 ZercMoE route with FlashComm1 SP MoE and shared-expert multistream overlap, independently or together. Shared experts overlap the fused operator without requiring internal stage events.
+    hardware: [A2]

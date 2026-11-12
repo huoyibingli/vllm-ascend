@@ -635,7 +635,11 @@ class FusedMC2CommImpl(MoECommMethod):
 
 
 class ZercMoECommImpl(MC2CommImpl):
-    """Reuse MC2 token sharding/gathering around the SHMEM fused operator."""
+    """Reuse MC2 token preparation around the SHMEM fused operator.
+
+    SP inputs already contain the local TP shard: MC2's replace_allreduce
+    path preserves that shard and mask, and skips the output all-gather.
+    """
 
     shared_activation_overlaps_routed_gmm1 = False
 
@@ -696,10 +700,12 @@ class ZercMoECommImpl(MC2CommImpl):
         if self.zerc_symm_buffer is None:
             self.zerc_symm_buffer = self._init_zerc_symm_buffer()
 
-        before_dispatch_evt = maybe_record_event()
         out, expert_tokens = run_zercmoe(inputs, weights, self.zerc_symm_buffer, w8a8=w8a8)
+        # A fused SHMEM operator exposes no internal stage boundaries. Leave
+        # all stage events unset so shared experts use the concurrent whole-MLP
+        # path. A dispatch-only event would select fine-grained synchronization
+        # and make shared experts wait for missing activation/combine events.
         return FusedExpertsResult(
             routed_out=out,
-            before_dispatch_evt=before_dispatch_evt,
             expert_tokens=expert_tokens,
         )

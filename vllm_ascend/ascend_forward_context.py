@@ -19,7 +19,6 @@ from vllm_ascend.device.hardware_profile import (
 from vllm_ascend.mrv2_utils import use_v2_model_runner
 from vllm_ascend.quantization.quant_type import A5_SUPPORT_MEGA_MOE_QUANT_TYPES, QuantType
 from vllm_ascend.utils import (
-    enable_sp,
     has_layer_idx,
     is_moe_model,
 )
@@ -149,7 +148,6 @@ def is_zercmoe_supported_by_config(vllm_config: VllmConfig) -> bool:
         or getattr(vllm_config, "weight_transfer_config", None) is not None
         or getattr(vllm_config, "lora_config", None) is not None
         or (vllm_config.use_v2_model_runner and vllm_config.speculative_config is not None)
-        or enable_sp(vllm_config)
     ):
         return False
 

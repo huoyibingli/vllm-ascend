@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
@@ -10,10 +11,182 @@ from vllm.config import CompilationMode, CUDAGraphMode
 
 from vllm_ascend import ascend_forward_context as afc
 from vllm_ascend.device.hardware_profile import MoECommPolicy
-from vllm_ascend.ops.fused_moe import zercmoe
+from vllm_ascend.ops.fused_moe import moe_comm_method, prepare_finalize, shared_experts, zercmoe
+from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
+    PreparedSharedExpertInput,
+    RoutedMoEMilestones,
+)
+from vllm_ascend.ops.fused_moe.shared_experts import SubmittedSharedExpertGateUp
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 class TestZercMoE(TestCase):
+    def test_sp_and_shared_overlap_preserve_zercmoe_eligibility(self):
+        for quantized in (False, True):
+            for sp in (False, True):
+                for overlap in (False, True):
+                    with self.subTest(quantized=quantized, sp=sp, overlap=overlap):
+                        ascend_config = SimpleNamespace(
+                            enable_zerc_moe=1,
+                            zercmoe_batch_mode="all",
+                            eplb_config=SimpleNamespace(dynamic_eplb=False, num_redundant_experts=0),
+                            mix_placement=False,
+                            deepgemm_mega_moe=False,
+                            xlite_graph_config=SimpleNamespace(enabled=False),
+                            multistream_overlap_shared_expert=overlap,
+                        )
+                        parallel = SimpleNamespace(
+                            enable_expert_parallel=True,
+                            tensor_parallel_size=8,
+                            pipeline_parallel_size=1,
+                            data_parallel_size=1,
+                            use_sequence_parallel_moe=sp,
+                        )
+                        config = SimpleNamespace(
+                            model_config=SimpleNamespace(
+                                dtype=torch.bfloat16,
+                                hf_text_config=SimpleNamespace(
+                                    hidden_size=2560, moe_intermediate_size=640, num_experts_per_tok=10
+                                ),
+                                is_quantized=quantized,
+                                architectures=["Qwen4ExpForCausalLM"],
+                                get_num_experts=lambda: 512,
+                            ),
+                            parallel_config=parallel,
+                            use_v2_model_runner=False,
+                            speculative_config=None,
+                            scheduler_config=SimpleNamespace(max_num_batched_tokens=65),
+                        )
+                        with (
+                            patch.object(afc, "get_ascend_config", return_value=ascend_config),
+                            patch.object(afc, "is_moe_model", return_value=True),
+                            patch.object(
+                                afc,
+                                "get_current_hardware_profile",
+                                return_value=SimpleNamespace(
+                                    supports=lambda _: True, moe_comm_policy=MoECommPolicy.ALLGATHER
+                                ),
+                            ),
+                            patch.object(afc, "get_ep_group", return_value=SimpleNamespace(world_size=8)),
+                            patch.object(zercmoe, "zercmoe_available", return_value=True),
+                        ):
+                            self.assertTrue(afc.use_cann_zercmoe(config))
+                            self.assertEqual(
+                                afc.select_moe_comm_method(1, config, zercmoe_prefill=True), afc.MoECommType.ZERC_MOE
+                            )
+                            parallel.data_parallel_size = 2
+                            self.assertFalse(afc.use_cann_zercmoe(config))
+
+    def test_sp_shards_masks_and_shared_overlap(self):
+        # Exercise ZercMoE's inherited MC2 preparation and real shared-expert
+        # synchronization together. Only the NPU kernels/collectives are mocked.
+        tp_size = 8
+        for quant_type in (QuantType.NONE, QuantType.W8A8):
+            for num_tokens in (1, 7, 8, 9, 65):
+                shard_size = (num_tokens + tp_size - 1) // tp_size
+                padded_tokens = shard_size * tp_size
+                states = (torch.arange(padded_tokens * 16) % 17).reshape(padded_tokens, 16).to(torch.bfloat16) / 16
+                logits = torch.arange(padded_tokens * 2).reshape(padded_tokens, 2).float()
+                context = SimpleNamespace(
+                    mc2_mask=torch.arange(padded_tokens) < num_tokens, padded_num_tokens=padded_tokens
+                )
+                outputs = []
+                for rank in range(tp_size):
+                    with self.subTest(quant_type=quant_type, tokens=num_tokens, rank=rank):
+                        comm = moe_comm_method.ZercMoECommImpl.__new__(moe_comm_method.ZercMoECommImpl)
+                        comm.moe_config = SimpleNamespace()
+                        comm.max_tokens_per_rank = shard_size
+                        comm.zerc_symm_buffer = object()
+                        comm.bf16_scratch = None
+                        start = rank * shard_size
+                        local = states[start : start + shard_size]
+                        local_logits = logits[start : start + shard_size]
+                        with (
+                            patch.object(
+                                prepare_finalize, "get_tensor_model_parallel_world_size", return_value=tp_size
+                            ),
+                            patch.object(prepare_finalize, "get_tensor_model_parallel_rank", return_value=rank),
+                            patch.object(prepare_finalize, "get_dynamic_mx_quant_scale_alg", return_value=0),
+                            patch.object(prepare_finalize, "_EXTRA_CTX", context),
+                            patch.object(prepare_finalize.dist, "all_gather") as gather,
+                        ):
+                            comm.prepare_finalize = comm._get_prepare_finalize()
+                            prepared = comm.prepare(local, local_logits, replace_allreduce=True)
+                            torch.testing.assert_close(prepared.hidden_states, local)
+                            torch.testing.assert_close(prepared.router_logits, local_logits)
+                            torch.testing.assert_close(prepared.mc2_mask, context.mc2_mask[start : start + shard_size])
+                            inputs = SimpleNamespace(
+                                hidden_states=prepared.hidden_states,
+                                quant=SimpleNamespace(quant_type=quant_type),
+                                activation="silu",
+                                routing=SimpleNamespace(apply_router_weight_on_input=False, mc2_mask=prepared.mc2_mask),
+                                layer=SimpleNamespace(zercmoe_weights=object()),
+                            )
+                            with (
+                                patch.object(moe_comm_method, "pack_bf16_zercmoe_weights", return_value=object()),
+                                patch.object(moe_comm_method, "maybe_record_event", return_value=object()) as event,
+                                patch.object(moe_comm_method, "run_zercmoe", return_value=(local + 1, None)) as kernel,
+                            ):
+                                fused = comm.fused_experts(inputs)
+                            event.assert_not_called()
+                            self.assertEqual(kernel.call_args.kwargs["w8a8"], quant_type == QuantType.W8A8)
+                            routed = comm.finalize(fused.routed_out, reduce_results=False)
+                            gather.assert_not_called()
+                        torch.testing.assert_close(routed, local + 1)
+                        milestones = RoutedMoEMilestones(
+                            routed_dispatch_start=fused.before_dispatch_evt,
+                            shared_activation_overlap_start=fused.shared_activation_overlap_start_evt,
+                            routed_combine_start=fused.before_combine_evt,
+                            routed_finalize_done=object(),
+                        )
+                        self.assertFalse(milestones.has_fine_grained_stage_events)
+                        shared = self._run_shared_with_fused_milestones(local, milestones, sp=True)
+                        outputs.append(routed + shared)
+                # The outer SP wrapper gathers and removes padding once.
+                torch.testing.assert_close(torch.cat(outputs)[:num_tokens], states[:num_tokens] * 2 + 1)
+
+    def _run_shared_with_fused_milestones(self, local, milestones, *, sp):
+        shared = shared_experts.AscendSharedExperts.__new__(shared_experts.AscendSharedExperts)
+        shared.multistream_overlap = True
+        mode = (
+            shared_experts.SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY
+            if sp
+            else shared_experts.SharedExpertParallelMode.TENSOR_PARALLEL
+        )
+        shared.parallel_mode = Mock(return_value=mode)
+        shared.layer = SimpleNamespace(down_proj=object())
+        shared.apply_activation = Mock(side_effect=lambda x: x)
+        shared._prepare_linear_input_for_overlap = Mock(side_effect=lambda layer, x: x)
+        shared.part2 = Mock(side_effect=lambda hidden, x: x)
+        shared._pad_and_reduce_scatter = Mock(side_effect=lambda x: x)
+        submitted = SubmittedSharedExpertGateUp(
+            hidden_states=local,
+            gate_up=local,
+            gate_up_input_scale=None,
+            local_dp_metadata=None,
+            path=shared_experts.SharedExpertMLPPath.LINEAR_WRAPPER,
+        )
+        stream = Mock()
+        with (
+            patch.object(shared_experts, "npu_stream_switch", side_effect=lambda *args, **kwargs: nullcontext()),
+            patch.object(shared_experts, "shared_experts_calculation_stream", return_value="shared_stream"),
+            patch.object(torch.npu, "current_stream", return_value=stream),
+        ):
+            output = shared.forward(PreparedSharedExpertInput(local), milestones, submitted_gate_up=submitted)
+        if sp:
+            stream.wait_event.assert_called_once_with(milestones.routed_finalize_done)
+            shared._pad_and_reduce_scatter.assert_called_once()
+        else:
+            stream.wait_event.assert_not_called()
+            shared._pad_and_reduce_scatter.assert_not_called()
+        stream.wait_stream.assert_called_once_with("shared_stream")
+        return output
+
+    def test_non_sp_shared_overlap_accepts_fused_milestones(self):
+        states = torch.randn(3, 16, dtype=torch.bfloat16)
+        output = self._run_shared_with_fused_milestones(states, RoutedMoEMilestones(), sp=False)
+        torch.testing.assert_close(output, states)
+
     def test_prefill_and_mixed_modes(self):
         def metadata(*prefilling):
             requests = [SimpleNamespace(is_prefill=phase) for phase in prefilling]

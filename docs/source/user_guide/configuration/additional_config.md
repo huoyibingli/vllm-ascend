@@ -106,6 +106,20 @@ To select ZercMoE for prefill, mixed and pure decode batches on a supported A2 m
 
 All modes retain the existing model, quantization, topology and external-wheel requirements. Empty batches, draft-model execution and batches exceeding `min(ceil(max_num_batched_tokens / TP), 4096) * TP` tokens retain the regular MoE route. `all` does not increase the 4096-token per-rank capacity.
 
+ZercMoE can be combined with FlashComm1 (SP MoE) and shared-expert multistream overlap:
+
+```json
+{
+  "enable_zerc_moe": 1,
+  "zercmoe_batch_mode": "all",
+  "enable_flashcomm1": true,
+  "multistream_overlap_shared_expert": true,
+  "enable_fused_mc2": 0
+}
+```
+
+SP inputs retain their local token shard and mask through ZercMoE; the outer SP wrapper handles output gathering. Shared experts run as a concurrent auxiliary-stream workload because the fused ZercMoE operator exposes no internal dispatch/MLP/combine stage events. The shared output is joined before use; SP-only shared-output reduction remains ordered after routed finalization. Overlap only applies to models with shared experts. Keep `enable_fused_mc2` at `0` for this combination: setting it to `1` automatically disables `multistream_overlap_shared_expert`.
+
 <span id="runtime_guard"></span>**runtime_guard**
 
 Runtime Guard provides online anomaly detection, structured incident reports, and optional native KV cache dump. See the [Runtime Guard feature guide](../feature_guide/runtime_guard.md) for usage and the [runtime_config reference](./runtime_config.md) for JSON fields.
