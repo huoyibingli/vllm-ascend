@@ -5,6 +5,7 @@
 Run each shape/precision in a fresh process with a compatible CANN operator:
     torchrun --nproc-per-node=8 test_a2_mega_moe_graph.py --tokens 32 --precision bf16
     torchrun --nproc-per-node=8 test_a2_mega_moe_graph.py --tokens 32 --precision w8a8
+    torchrun --nproc-per-node=8 test_a2_mega_moe_graph.py --tokens 32 --precision w8a8 --shared-overlap
 
 Checks updated inputs, routes, padding and expert counts against eager calls.
 This isolates graph integration; it does not establish end-to-end model throughput.
@@ -22,8 +23,9 @@ import torch.distributed as dist
 import torch_npu
 
 from vllm_ascend.a2_mega_moe import A2MegaMoEPrefillConfig
-from vllm_ascend.ops.fused_moe import moe_comm_method, prepare_finalize
+from vllm_ascend.ops.fused_moe import moe_comm_method, prepare_finalize, shared_experts
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
+from vllm_ascend.ops.fused_moe.dataclass.shared_experts import RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.moe_utils import _get_cann_mega_moe_quant_settings, load_cann_mega_moe_ops
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import scale_from_float_to_int64
@@ -34,6 +36,36 @@ INTERMEDIATE = 640
 EXPERTS = 512
 TOPK = 10
 EP_SIZE = 8
+SHARED_INTERMEDIATE_PER_RANK = 128
+
+
+class TupleLinear(torch.nn.Linear):
+    """Dense shared-expert linear with the production wrapper return contract."""
+
+    def forward(self, x):
+        return super().forward(x), None
+
+
+def make_shared_experts(group):
+    # Exercise the production shared scheduler with TP-sharded BF16 shared
+    # weights, for either BF16 or W8A8 routed experts (partial quantization).
+    layer = torch.nn.Module()
+    layer.gate_up_proj = TupleLinear(
+        HIDDEN, 2 * SHARED_INTERMEDIATE_PER_RANK, bias=False, device="npu", dtype=torch.bfloat16
+    )
+    layer.down_proj = TupleLinear(SHARED_INTERMEDIATE_PER_RANK, HIDDEN, bias=False, device="npu", dtype=torch.bfloat16)
+    layer.expert_gate = TupleLinear(HIDDEN, 1, bias=False, device="npu", dtype=torch.bfloat16)
+    # The scalar output gate is replicated, while Gate-Up/Down weights are TP shards.
+    dist.broadcast(layer.expert_gate.weight, src=0, group=group)
+    layer.act_fn = lambda x: torch.nn.functional.silu(x.chunk(2, dim=-1)[0]) * x.chunk(2, dim=-1)[1]
+    shared = object.__new__(shared_experts.AscendSharedExperts)
+    shared.layer = layer
+    shared.moe_config = SimpleNamespace(is_sequence_parallel=True, tp_group=SimpleNamespace(world_size=EP_SIZE))
+    shared.weights_replicated = False
+    shared.multistream_overlap = True
+    shared.quant_type = QuantType.NONE
+    shared.lora_context = None
+    return shared
 
 
 def make_weights(precision):
@@ -73,7 +105,9 @@ def run(args, rank, group):
     weights = make_weights(args.precision)
     quant = QuantType.NONE if args.precision == "bf16" else QuantType.W8A8
     quant_mode, quant_dtype, _ = _get_cann_mega_moe_quant_settings(quant)
-    context = SimpleNamespace(mc2_mask=None, padded_num_tokens=args.tokens, in_profile_run=False)
+    context = SimpleNamespace(
+        mc2_mask=None, padded_num_tokens=args.tokens, num_tokens=args.tokens * EP_SIZE, in_profile_run=False
+    )
     config = SimpleNamespace(a2_mega_moe_prefill=A2MegaMoEPrefillConfig(enabled=True))
     comm = object.__new__(moe_comm_method.FusedMC2CommImpl)
     comm.mega_moe = mega
@@ -99,8 +133,31 @@ def run(args, rank, group):
     ids = torch.arange(TOPK, dtype=torch.int32, device="npu").expand(args.tokens, -1).clone()
     probs = torch.full((args.tokens, TOPK), 1 / TOPK, device="npu")
     padding = torch.ones(args.tokens, dtype=torch.bool, device="npu")
+    shared = make_shared_experts(group) if args.shared_overlap else None
+
+    def tp_gather(x, dim):
+        assert dim == 0
+        gathered = torch.empty((x.shape[0] * EP_SIZE, x.shape[1]), dtype=x.dtype, device=x.device)
+        dist.all_gather_into_tensor(gathered, x.contiguous(), group=group)
+        return gathered
+
+    def tp_scatter(x, dim):
+        assert dim == 0
+        output = torch.empty((x.shape[0] // EP_SIZE, x.shape[1]), dtype=x.dtype, device=x.device)
+        dist.reduce_scatter_tensor(output, x.contiguous(), group=group)
+        return output
 
     def fused():
+        if shared is not None:
+            # TP gather remains on the calling stream, before routed EP work.
+            shared_input = shared.prepare_input_before_routed(x)
+            ready = torch.npu.current_stream().record_event()
+            prepared_execution = shared.prepare_for_router_overlap(shared_input, ready)
+            submitted = (
+                shared.enqueue_gate_up_after_router(prepared_execution, ready)
+                if prepared_execution is not None
+                else None
+            )
         prepared = prepare.prepare(x, ids)
         inputs = build_fused_experts_input(
             hidden_states=prepared.hidden_states,
@@ -111,7 +168,16 @@ def run(args, rank, group):
             mc2_mask=prepared.mc2_mask,
             layer=layer,
         )
-        return comm._apply_cann_mega_moe(inputs, weights, is_decode_only_node=False)
+        routed_out, counts = comm._apply_cann_mega_moe(inputs, weights, is_decode_only_node=False)
+        if shared is not None:
+            milestones = RoutedMoEMilestones(
+                shared_input_ready=ready,
+                router_output_ready=ready,
+                routed_finalize_done=torch.npu.current_stream().record_event(),
+            )
+            shared_out = shared.forward(shared_input, milestones, submitted_gate_up=submitted)
+            routed_out = routed_out + shared_out
+        return routed_out, counts
 
     # Mimic MRv2 capture: the mask is derived inside the graph from a persistent
     # input. Capture with all rows inactive; change those same tensors on replay.
@@ -120,6 +186,9 @@ def run(args, rank, group):
         patch.object(moe_comm_method, "_EXTRA_CTX", context),
         patch.object(prepare_finalize, "_EXTRA_CTX", context),
         patch.object(prepare_finalize, "get_forward_context", return_value=SimpleNamespace(is_padding=padding)),
+        patch.object(shared_experts, "_EXTRA_CTX", context),
+        patch.object(shared_experts, "tensor_model_parallel_all_gather", side_effect=tp_gather),
+        patch.object(shared_experts, "tensor_model_parallel_reduce_scatter", side_effect=tp_scatter),
     ):
         for _ in range(3):
             fused()
@@ -136,7 +205,15 @@ def run(args, rank, group):
             probs.copy_(torch.softmax(torch.randn_like(probs), dim=-1))
             padding.fill_(True)
             padding[:valid] = False
-            expected, expected_counts = fused()
+            # Compare overlapped capture/replay against the serial scheduler
+            # using the same routed op, shared weights, inputs and collectives.
+            if shared is not None:
+                shared.multistream_overlap = False
+            try:
+                expected, expected_counts = fused()
+            finally:
+                if shared is not None:
+                    shared.multistream_overlap = True
             torch.npu.synchronize()
             graph.replay()
             torch.npu.synchronize()
@@ -148,8 +225,17 @@ def run(args, rank, group):
             torch.testing.assert_close(captured[1].flatten().long(), local, rtol=0, atol=0)
         eager_us = measure(fused, args.repeats)
         graph_us = measure(graph.replay, args.repeats)
+        serial_us = None
+        if shared is not None:
+            shared.multistream_overlap = False
+            serial_us = measure(fused, args.repeats)
     if rank == 0:
-        print(json.dumps({**vars(args), "eager_us": eager_us, "graph_us": graph_us, "passed": True}), flush=True)
+        print(
+            json.dumps(
+                {**vars(args), "serial_us": serial_us, "eager_us": eager_us, "graph_us": graph_us, "passed": True}
+            ),
+            flush=True,
+        )
 
 
 def main():
@@ -157,6 +243,9 @@ def main():
     parser.add_argument("--tokens", type=int, default=32, help="Padded rows per rank; run a fresh process per shape")
     parser.add_argument("--precision", choices=("bf16", "w8a8"), default="bf16")
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument(
+        "--shared-overlap", action="store_true", help="Include TP8/SP shared MLP and side-stream replay"
+    )
     args = parser.parse_args()
     if args.tokens < 1 or args.repeats < 1:
         parser.error("tokens and repeats must be positive")

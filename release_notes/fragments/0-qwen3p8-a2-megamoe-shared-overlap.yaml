@@ -1,0 +1,6 @@
+pr: 0
+entries:
+  - category: feature
+    text: Allow explicitly enabled Qwen3.8-Flash-Next A2 CANN MegaMoE to retain multistream_overlap_shared_expert, including FlashComm1 sequence-parallel execution and ordinary stage-policy fallback. Reuse whole-MLP auxiliary-stream scheduling with ordered input AllGather, routed-finalize output ReduceScatter and a shared-output join. Legacy fused-MC2 configurations retain automatic overlap disablement. Target-hardware precision, replay and performance validation remain required.
+    model: qwen3.8-flash-next
+    hardware: [A2]

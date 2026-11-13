@@ -141,8 +141,53 @@ per rank and INT8 payload about 14.063 GiB, excluding other model weights,
 scales, NZ layout overhead and buffers. Neither backend incurs the old explicit
 768-wide GMM shape expansion. BF16 fallback still uses ND TensorLists, so
 matching the original width alone does not establish identical performance.
-The existing fused-MC2 configuration disables shared-expert multistream overlap.
+Shared-expert multistream overlap remains disabled by default. The validated A2
+MegaMoE opt-in can retain it when explicitly enabled, as described below.
 Benchmark the complete model against the original configuration before rollout.
+
+## FlashComm1 and shared-expert overlap
+
+The A2 MegaMoE opt-in supports `multistream_overlap_shared_expert=true`, with or
+without FlashComm1. For example, to combine SP, shared-expert overlap and the
+prefill/mixed policy on MRv2:
+
+```shell
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /path/to/Qwen3.8-Flash-Next \
+  --dtype bfloat16 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --additional-config '{"enable_fused_mc2":2,"enable_flashcomm1":true,"multistream_overlap_shared_expert":true,"a2_mega_moe_prefill":{"enabled":true,"scope":"prefill_mixed"}}'
+```
+
+`enable_flashcomm1` selects SP MoE when the model/parallel configuration supports
+it. The combination reuses the existing shared-expert scheduler: Gate-Up is
+submitted on the auxiliary stream after the router is ready, before routed
+TopK and dispatch. MegaMoE has no intermediate stage events, so shared activation
+and Down execute without waiting for routed GMM/combine boundaries. The shared
+MLP stays outside MegaMoE rather than becoming an internal shared-expert kernel.
+
+For TP-sharded shared weights with SP inputs, input AllGather stays on the main
+stream before routed communication. Shared output ReduceScatter waits for routed
+finalization, and the main stream joins shared output before consumption. These
+dependencies preserve cross-rank collective order; only the independent shared
+compute is submitted concurrently. Models without shared experts have no shared
+work to overlap. Existing BF16 and W8A8 shared linear paths retain their math.
+
+The option is global: with `scope="prefill_mixed"`, ordinary pure-decode
+ALLGATHER execution also retains its existing shared-expert overlap. All three
+scope values are supported. Captured graphs retain their captured stream/event
+dependencies, and changing the overlap option requires restart and recapture.
+
+The exception applies only to the explicitly enabled, validated A2 CANN
+MegaMoE integration. Legacy `dispatch_ffn_combine` and other fused-MC2
+configurations keep the existing automatic overlap disablement. Setting
+`enable_fused_mc2=2` alone does not grant that exception.
+
+Concurrency does not establish a speedup: routed and shared work can compete for
+compute and memory resources. Compare overlap off/on with identical SP, graph,
+workload and memory settings, and validate both kernel precision and complete
+model throughput on the target eight-card A2 stack.
 
 ## Communication capacity
 
@@ -183,6 +228,7 @@ weight-producer and scale tests can run without a vLLM or NPU installation:
 
 ```shell
 python -m pytest --noconftest -q tests/ut/ops/test_a2_mega_moe.py
+python -m pytest --noconftest -q tests/ut/ops/test_a2_mega_moe_overlap.py
 ```
 
 An eight-card A2 standalone regression exercises native I640 BF16/W8A8 eager
@@ -193,6 +239,14 @@ each shape/precision in a fresh process, for example:
 torchrun --nproc-per-node=8 tests/e2e/nightly/single_node/ops/test_a2_mega_moe_graph.py --tokens 32 --precision bf16
 torchrun --nproc-per-node=8 tests/e2e/nightly/single_node/ops/test_a2_mega_moe_graph.py --tokens 32 --precision w8a8
 ```
+
+Add `--shared-overlap` to either precision to include a TP8/SP shared BF16 MLP,
+its output gate, and the production shared scheduler in the regression. It
+compares overlapped graph replay against serial shared execution using the same
+weights and inputs, and reports serial eager, overlapped eager and overlapped
+graph latency. W8A8 in this standalone case refers to the routed experts; shared
+weights remain BF16. Quantized shared experts and the full model require their
+separate target-hardware validation.
 
 Repeat with per-rank token counts such as 1, 8 and 512. The regression checks
 changed routing and active rows against eager outputs and independently checks

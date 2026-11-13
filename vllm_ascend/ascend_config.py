@@ -826,11 +826,17 @@ class AscendConfig:
             "Set additional_config.enable_fused_mc2 to 2 to enable MegaMoe, or 0 to disable fused MC2."
         )
         if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
-            self.multistream_overlap_shared_expert = False
-            logger.warning_once(
-                "enable_fused_mc2 and multistream_overlap_shared_expert "
-                "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
-            )
+            if self.a2_mega_moe_prefill.enabled is True and is_mega_moe_supported():
+                # The A2 opt-in was validated above. FusedMC2 exposes no stage
+                # events, so shared experts use the existing whole-MLP side
+                # stream path, with SP collectives ordered around routed MoE.
+                logger.info_once("A2 MegaMoE shared-expert multistream overlap is enabled.")
+            else:
+                self.multistream_overlap_shared_expert = False
+                logger.warning_once(
+                    "enable_fused_mc2 and multistream_overlap_shared_expert "
+                    "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
+                )
         if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
             self.enable_fused_mc2 = 0
             logger.warning_once(
