@@ -233,6 +233,15 @@ class TestAscendConfig(TestBase):
         with self.assertRaisesRegex(ValueError, "load_collection_phase must be one of"):
             EplbConfig(load_collection_phase="prompt")
 
+    def test_qsa_fia_prefill_threshold(self):
+        kwargs = {"sparse_kv_offload_config": SimpleNamespace(enabled=False)}
+        self.assertEqual(AscendConfig(**kwargs).qsa_fia_prefill_threshold, 24576)
+        for value in (0, 176640):
+            self.assertEqual(AscendConfig(**kwargs, qsa_fia_prefill_threshold=value).qsa_fia_prefill_threshold, value)
+        for value in (-1, True, 1.5, "176640", None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "qsa_fia_prefill_threshold"):
+                AscendConfig(**kwargs, qsa_fia_prefill_threshold=value)
+
     def test_stair_config_defaults_and_overrides(self):
         defaults = EplbConfig().stair_config
         config = EplbConfig(stair_config={"rank_transfer_limit": 2, "load_risk_quantile": 0.9})

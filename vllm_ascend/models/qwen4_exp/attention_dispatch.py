@@ -5,10 +5,10 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_ascend.ascend_config import DEFAULT_QSA_FIA_PREFILL_THRESHOLD
+
 from .fia import prepare_qsa_fia_paged_kv, qsa_fia_attention
 from .gbsa import qsa_gbsa_attention
-
-QSA_FIA_MAX_LOGICAL_KV_LENGTH = 24 * 1024
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class QSARequest:
     query_end: int
     kv_length: int
     is_prefill: bool
+    fia_prefill_threshold: int = DEFAULT_QSA_FIA_PREFILL_THRESHOLD
 
     @property
     def use_paged_kv(self) -> bool:
@@ -30,18 +31,10 @@ class QSARequest:
 
     @property
     def fia_query_end(self) -> int:
-        """Keep a chunk crossing 24K on FIA; switch subsequent chunks."""
-        if not self.is_prefill:
-            return self.query_start
+        """Route the whole prefill chunk by its starting logical KV length."""
         query_length = self.query_end - self.query_start
-        # Scheduler seq_lens already includes the current query chunk.
-        total_logical_kv_length = self.kv_length
-        fits_fia_limit = total_logical_kv_length <= QSA_FIA_MAX_LOGICAL_KV_LENGTH
-        crosses_fia_limit = (
-            total_logical_kv_length > QSA_FIA_MAX_LOGICAL_KV_LENGTH
-            and total_logical_kv_length - query_length < QSA_FIA_MAX_LOGICAL_KV_LENGTH
-        )
-        if fits_fia_limit or crosses_fia_limit:
+        history = self.kv_length - query_length
+        if self.is_prefill and history < self.fia_prefill_threshold:
             return self.query_end
         return self.query_start
 
@@ -74,6 +67,7 @@ def build_qsa_request_plan(
     seq_lens_cpu: torch.Tensor,
     num_actual_tokens: int,
     is_prefilling_cpu: torch.Tensor,
+    fia_prefill_threshold: int = DEFAULT_QSA_FIA_PREFILL_THRESHOLD,
 ) -> QSARequestPlan:
     """Classify mixed-batch rows once for reuse by every QSA layer."""
     if any(t.device.type != "cpu" for t in (query_start_loc_cpu, seq_lens_cpu, is_prefilling_cpu)):
@@ -89,7 +83,14 @@ def build_qsa_request_plan(
         end = min(max(end, start), num_actual_tokens)
         if end > start:
             requests.append(
-                QSARequest(request_index, start, end, int(lengths[request_index]), bool(phases[request_index]))
+                QSARequest(
+                    request_index,
+                    start,
+                    end,
+                    int(lengths[request_index]),
+                    bool(phases[request_index]),
+                    fia_prefill_threshold,
+                )
             )
     requests_tuple = tuple(requests)
     fia_requests = tuple(request for request in requests_tuple if request.use_fia)

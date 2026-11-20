@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadat
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -494,6 +495,7 @@ class AscendQSAMetadataBuilder(upstream_qsa.Qwen4ExpQSAMetadataBuilder):
                 lengths,
                 common_attn_metadata.num_actual_tokens,
                 phases,
+                get_ascend_config().qsa_fia_prefill_threshold,
             )
         return metadata
 

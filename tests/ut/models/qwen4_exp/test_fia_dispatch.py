@@ -25,6 +25,7 @@ def implementation():
     namespace = {"torch": torch, "dataclass": dataclass, "__name__": __name__}
     _load_source("gbsa.py", namespace)
     _load_source("fia.py", namespace)
+    namespace["DEFAULT_QSA_FIA_PREFILL_THRESHOLD"] = 24 * 1024
     _load_source("attention_dispatch.py", namespace)
     return namespace
 
@@ -187,6 +188,19 @@ def test_chunk_start_policy_including_large_initial_prefill(implementation, quer
     assert request.gbsa_query_start == (query_length if expected_fia else 0)
 
 
+@pytest.mark.parametrize("threshold,expected", [(176640, [True, True, False, False]), (0, [False] * 4)])
+def test_configured_threshold_routes_each_request(implementation, threshold, expected):
+    # Three prefills starting at 0, 176639 and 176640, followed by a decode.
+    plan = implementation["build_qsa_request_plan"](
+        torch.tensor([0, 4, 8, 12, 13]),
+        torch.tensor([4, 176643, 176644, 1]),
+        13,
+        torch.tensor([True, True, True, False]),
+        threshold,
+    )
+    assert [request.use_fia for request in plan] == expected
+
+
 def run_stub_batch(implementation, phases, query_lengths, kv_lengths):
     starts = [0]
     for length in query_lengths:
@@ -317,6 +331,7 @@ def load_builder():
         AttentionCGSupport=SimpleNamespace(UNIFORM_BATCH="uniform"),
         CommonAttentionMetadata=object,
         build_qsa_request_plan=plan,
+        get_ascend_config=lambda: SimpleNamespace(qsa_fia_prefill_threshold=176640),
     )
     exec(compile(ast.Module(body=[builder], type_ignores=[]), str(source), "exec"), namespace)
     return namespace["AscendQSAMetadataBuilder"](), plans
@@ -344,7 +359,8 @@ def test_metadata_builder_uses_phase_flags_and_host_lengths_for_prefill():
     )
     meta = builder.build(0, common)
     assert meta.block_table == "kept" and meta.qsa_request_plan == ("prefill-plan",)
-    assert plans[0][-1] is common.is_prefilling
+    assert plans[0][-2] is common.is_prefilling
+    assert plans[0][-1] == 176640
 
 
 def test_metadata_builder_rejects_unknown_phase_instead_of_guessing():

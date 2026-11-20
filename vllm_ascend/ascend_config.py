@@ -21,9 +21,9 @@ import json
 import math
 import os
 from statistics import NormalDist
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 _KVPP_SUPPORTED_CONNECTORS = ("MooncakeConnectorV2", "AscendStoreConnector")
 _MEGA_MOE_SUPPORTED = None
+DEFAULT_QSA_FIA_PREFILL_THRESHOLD = 24 * 1024
 
 
 def is_mega_moe_supported() -> bool:
@@ -440,6 +441,7 @@ class AscendConfig:
             "mix_placement": false,
             "pa_shape_list": [],
             "mega_moe_max_tokens": 65536,
+            "qsa_fia_prefill_threshold": 24576,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
             "enable_fused_mc2": 0,
             "enable_mlapo": true,
@@ -600,6 +602,7 @@ class AscendConfig:
     # degradation. Do not set it too large because workspace memory scales
     # linearly with this value. Default 65536.
     mega_moe_max_tokens: int = 65536
+    qsa_fia_prefill_threshold: Annotated[int, Field(strict=True, ge=0)] = DEFAULT_QSA_FIA_PREFILL_THRESHOLD
     ascend_log_path: str = dataclasses.field(
         default_factory=lambda: os.path.join(os.path.expanduser("~"), "ascend", "log", "vllm_ascend")
     )
