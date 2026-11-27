@@ -38,6 +38,7 @@ from vllm_ascend.attention.utils import (
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
+from vllm_ascend.ops.qsa_fused import is_qsa_indexer_fused_enabled
 from vllm_ascend.ops.triton.linearnorm import qsa_rmsnorm_mrope as _qsa_rmsnorm_mrope  # noqa: F401
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
     qsa_compress_groups_with_ratio as qsa_compress_groups_with_ratio_fused,
@@ -297,13 +298,21 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             num_tokens = raw_metadata.num_actual_tokens
             hidden_states = hidden_states[:num_tokens]
             positions = positions[..., :num_tokens]
-            query, token_k = self.project_qk(hidden_states, positions)
-            self._update_and_compress(
-                token_k,
-                positions,
-                raw_metadata,
-                compressed_metadata,
-            )
+            query = None
+            if self._qsa_fused_v2_gate() and (
+                positions.ndim == 1 or getattr(self.rotary_emb, "mrope_interleaved", False)
+            ):
+                query = self._forward_qsa_fused_v2(
+                    hidden_states, positions, raw_metadata, compressed_metadata
+                )
+            if query is None:
+                query, token_k = self.project_qk(hidden_states, positions)
+                self._update_and_compress(
+                    token_k,
+                    positions,
+                    raw_metadata,
+                    compressed_metadata,
+                )
 
             if self.skip_topk:
                 if out is None:
@@ -422,6 +431,194 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
                 raw_metadata.slot_mapping,
                 position_rows,
             )
+
+    def process_weights_after_loading(self) -> None:
+        """Capture the QSA projection weight for the fused aclnn operator.
+
+        ``finalize_model_weights`` runs this hook children-first, i.e. after
+        the quant method already processed ``index_qk_proj``: the weight is
+        the transposed [hidden, qk_width] int8 plane, possibly in NZ format.
+        Keep an ND [qk_width, hidden] copy for ``cloud_qsa_indexer_fused_v2``,
+        which consumes the pre-transpose W8A8_DYNAMIC layout. Layers without
+        an int8 projection (e.g. bf16 MTP drafts) simply skip the capture and
+        keep the Triton path.
+        """
+        proj = self.index_qk_proj
+        weight = getattr(proj, "weight", None)
+        scale = getattr(proj, "weight_scale_fp32", None)
+        if scale is None:
+            scale = getattr(proj, "weight_scale", None)
+        if weight is None or scale is None or weight.dtype != torch.int8:
+            return
+        qk_width = (self.index_n_heads + self.index_kv_heads) * self.index_head_dim
+        hidden = getattr(proj, "input_size", None) or weight.shape[-1]
+        w = weight.data
+        if tuple(w.shape) == (qk_width, hidden):
+            nd_weight = w.contiguous()
+        elif tuple(w.shape) == (hidden, qk_width):
+            nd_weight = w.t().contiguous()
+        else:
+            return
+        self._qsa_fused_weight_nd = nd_weight
+        self._qsa_fused_weight_scale = (
+            scale.data.detach().reshape(-1).to(torch.float32).clone()
+        )
+        if is_qsa_indexer_fused_enabled():
+            # Resolve the extension and structural gates now, in host context,
+            # so no JIT build happens inside a graph capture later.
+            self._qsa_fused_v2_gate()
+
+    def _qsa_fused_v2_gate(self) -> bool:
+        """Latched per-layer gate for the fused QSA operator (host checks only)."""
+        gate = getattr(self, "_qsa_fused_gate", None)
+        if gate is not None:
+            return gate
+        gate = False
+        if is_qsa_indexer_fused_enabled():
+            try:
+                gate = self._qsa_fused_v2_setup()
+            except Exception as exc:  # pragma: no cover - config dependent
+                logger.warning_once(
+                    "QSA fused-v2 setup failed (%s); keeping the Triton QSA path.",
+                    exc,
+                )
+                gate = False
+        self._qsa_fused_gate = gate
+        if gate:
+            logger.info_once(
+                "QSA indexer uses cloud_qsa_indexer_fused_v2 (int8 projection "
+                "+ group compression + RMSNorm + mRoPE)."
+            )
+        return gate
+
+    def _qsa_fused_v2_setup(self) -> bool:
+        """Structural checks matching the operator's hard constraints."""
+        weight = getattr(self, "_qsa_fused_weight_nd", None)
+        scale = getattr(self, "_qsa_fused_weight_scale", None)
+        if weight is None or scale is None:
+            return False
+        if self.index_head_dim != 128 or weight.shape[-1] != 2560:
+            return False
+        rotary = self.rotary_emb
+        if int(getattr(rotary, "rotary_dim", 0)) != 64:
+            return False
+        if self.q_layernorm.weight.dtype != torch.bfloat16:
+            return False
+        ratio = int(getattr(self, "compress_ratio", 0))
+        if not 1 <= ratio <= 32:  # MAX_RATIO in the operator kernel
+            return False
+        quant_method = getattr(self.index_qk_proj, "quant_method", None)
+        if getattr(quant_method, "act_quant_type", torch.int8) != torch.int8:
+            return False
+        return True
+
+    def _forward_qsa_fused_v2(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        raw_metadata: QSAIndexerMetadataProtocol,
+        compressed_metadata: QSAIndexerMetadataProtocol,
+    ) -> torch.Tensor | None:
+        """Run projection, compression, norm and mRoPE in one operator call.
+
+        Returns the rotated indexer query, or None when the operator path is
+        unavailable for this step (the caller falls back to the Triton path).
+        The cache stores run only after the operator call succeeded, so a
+        fallback never double-writes the caches.
+        """
+        num_tokens = hidden_states.shape[0]
+        if num_tokens == 0:
+            return None
+        import torch_npu
+
+        rope_position_cache = self.raw_key_cache.rope_position_cache
+        try:
+            from vllm_ascend.ops.qsa_fused import cloud_qsa_indexer_fused_v2
+
+            act_quant_type = getattr(
+                getattr(self.index_qk_proj, "quant_method", None),
+                "act_quant_type",
+                torch.int8,
+            )
+            act_q, act_s = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=act_quant_type
+            )
+            if act_s.dim() == 2:
+                act_q = act_q.squeeze(1)
+                act_s = act_s.squeeze(1)
+            pos = positions
+            if pos.ndim == 1:
+                # The operator consumes the [3, tokens] mRoPE table.
+                pos = pos.unsqueeze(0).expand(3, -1)
+            if pos.dtype not in (torch.int32, torch.int64):
+                pos = pos.to(torch.int64)
+            if not pos.is_contiguous():
+                pos = pos.contiguous()
+            cos_sin = self.rotary_emb._match_cos_sin_cache_dtype(hidden_states)  # noqa: SLF001
+            q_out, k_out, raw_k_out = cloud_qsa_indexer_fused_v2(
+                act_q,
+                self._qsa_fused_weight_nd,
+                self._qsa_fused_weight_scale,
+                act_s,
+                pos,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                cos_sin,
+                self.raw_key_cache.key_cache,
+                raw_metadata.block_table.to(torch.int32),
+                raw_metadata.token_to_req.to(torch.int32),
+                raw_metadata.query_start_loc.to(torch.int32),
+                raw_metadata.logical_positions.to(torch.int64),
+                compressed_metadata.slot_mapping.to(torch.int64),
+                (
+                    rope_position_cache
+                    if rope_position_cache is not None
+                    else torch.empty(
+                        0, dtype=torch.int64, device=hidden_states.device
+                    )
+                ),
+                self.index_n_heads,
+                self.index_kv_heads,
+                self.index_head_dim,
+                float(self.q_layernorm.variance_epsilon),
+                self.rotary_emb.rotary_dim,
+                self.compress_ratio,
+                0,
+            )
+        except Exception as exc:  # pragma: no cover - operator/dispatch specific
+            self._qsa_fused_gate = False
+            logger.warning_once(
+                "cloud_qsa_indexer_fused_v2 failed (%s); falling back to the "
+                "Triton QSA path for this and future steps.",
+                exc,
+            )
+            return None
+        head_dim = self.index_head_dim
+        # k_out rows are the pooled + normalized + rotated group keys; rows
+        # without a completed group are zero and their slots are -1, which
+        # the store kernel masks out.
+        _store_qsa_cache_rows(
+            self.compressed_key_cache.kv_cache,
+            compressed_metadata.slot_mapping,
+            k_out.view(num_tokens, 1, head_dim),
+        )
+        # raw_k_out is the dequantized raw K plane; the raw ring cache keeps
+        # pre-rotation keys for later batches' cross-batch group lookback.
+        _store_qsa_cache_rows(
+            self.raw_key_cache.key_cache,
+            raw_metadata.slot_mapping,
+            raw_k_out.view(num_tokens, 1, head_dim),
+        )
+        if rope_position_cache is not None:
+            position_rows = qsa_indexer.canonical_qsa_rope_positions(positions)[
+                :num_tokens
+            ].to(device=self.raw_key_cache.key_cache.device)
+            _store_qsa_cache_rows(
+                rope_position_cache,
+                raw_metadata.slot_mapping,
+                position_rows,
+            )
+        return q_out.view(num_tokens, self.index_n_heads, head_dim)
 
     def _select(
         self,

@@ -92,6 +92,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Use the fused cloud_qsa_indexer_fused_v2 operator (int8 quant matmul +
+    # compression + RMSNorm + mRoPE) for the Qwen4Exp QSA indexer when the
+    # layer carries W8A8_DYNAMIC weights. Unset/0 keeps the Triton path.
+    "VLLM_ASCEND_ENABLE_QSA_INDEXER_FUSED": lambda: os.getenv("VLLM_ASCEND_ENABLE_QSA_INDEXER_FUSED", None),
 }
 
 # end-env-vars-definition
